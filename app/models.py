@@ -31,6 +31,15 @@ class OCRRequest(BaseModel):
         None,
         description="是否启用文档矫正（覆盖全局配置）",
     )
+    include: Optional[List[str]] = Field(
+        None,
+        description=(
+            "按需返回字段列表，不传则默认全部返回。"
+            "可选值: markdown, text, elements, layout_blocks, hallucination_warnings。"
+            "route/timing_ms/page/error_detail 等核心元数据始终返回，不受此参数影响。"
+        ),
+        example=["markdown", "elements"],
+    )
 
 
 class OCRBatchRequest(BaseModel):
@@ -43,15 +52,63 @@ class OCRBatchRequest(BaseModel):
     )
 
 
+class Element(BaseModel):
+    """单个文档结构元素（段落/表格/公式/图表/印章）"""
+    id: str = Field(..., description="元素ID，格式 p{page}_e{index}，如 p3_e1")
+    type: str = Field(
+        ...,
+        description=(
+            "元素类型: "
+            "paragraph(正文段落/行) / table / formula / chart / seal / page_text(vlm路由兜底整页文本)"
+        ),
+    )
+    reading_order: int = Field(..., description="页内阅读顺序，从0开始")
+    bbox: Optional[List[float]] = Field(
+        None,
+        description="[x1,y1,x2,y2]绝对像素坐标（相对于该页渲染图）。"
+                    "vlm路由的page级别元素为null，表示该内容来自整页推理、无法归属到具体子区域",
+    )
+    confidence: Optional[float] = Field(
+        None,
+        description="置信度。table来自表格引擎(如有)；light_ocr来自PP-OCR逐行识别置信度；"
+                    "vlm路由的元素为null(VLM当前不返回逐token置信度)",
+    )
+    content: dict = Field(
+        ...,
+        description=(
+            "按type区分结构:\n"
+            "  paragraph / page_text: {\"text\": str}\n"
+            "  table: {\"html\": str}\n"
+            "  formula: {\"text\": str}\n"
+            "  chart / seal: {\"text\": str}"
+        ),
+    )
+
+
 class OCRResultPage(BaseModel):
     """单页OCR结果"""
     page: int = Field(..., description="页码（从1开始）")
-    markdown: Optional[str] = Field(None, description="该页的Markdown识别结果")
-    text: Optional[str] = Field(None, description="该页的纯文本识别结果")
-    route: Optional[str] = Field(None, description="该页路由: light_ocr / vlm / error")
+    markdown: Optional[str] = Field(None, description="该页的Markdown识别结果（由elements按reading_order派生拼接）")
+    text: Optional[str] = Field(None, description="该页的纯文本识别结果（由elements派生）")
+    elements: Optional[List[Element]] = Field(
+        None, description="结构化元素列表。include不含'elements'时省略"
+    )
+    layout_blocks: Optional[List[dict]] = Field(
+        None,
+        description=(
+            "版面检测(PP-DocLayoutV3)标注的区域位置: "
+            "[{label, score, bbox}, ...]。注意：这是纯位置标注，不代表对应内容已被单独裁剪识别"
+            "（vlm路由的公式/图表/印章区域即属此情况，具体内容请看该页elements里的page_text）。"
+            "include不含'layout_blocks'时省略"
+        ),
+    )
+    route: Optional[str] = Field(None, description="该页路由: light_ocr / table / vlm / error")
+    error_detail: Optional[str] = Field(
+        None,
+        description="route=error时的具体原因: timeout / connection_error / hallucination_retry_failed / unknown",
+    )
     timing_ms: Optional[int] = Field(None, description="该页处理耗时(毫秒)")
-    classification: Optional[dict] = Field(None, description="PP-DocLayoutV3 版面分类详情: {label, detected_complex, blocks}")
-    hallucination_warnings: Optional[list] = Field(None, description="VLM 幻觉检测警告列表")
+    hallucination_warnings: Optional[list] = Field(None, description="VLM幻觉检测警告列表")
 
 
 class OCRResultItem(BaseModel):
@@ -61,7 +118,7 @@ class OCRResultItem(BaseModel):
     file_type: str = Field("image", description="文件类型: image/pdf")
     success: bool = Field(..., description="是否成功")
     total_pages: int = Field(1, description="总页数（PDF多页时>1）")
-    markdown: Optional[str] = Field(None, description="Markdown格式的完整识别结果（多页已合并）")
+    markdown: Optional[str] = Field(None, description="Markdown格式的完整识别结果（多页已合并，含页码锚点）")
     text: Optional[str] = Field(None, description="纯文本格式的完整识别结果")
     pages: Optional[List[OCRResultPage]] = Field(None, description="逐页识别结果")
     route_summary: Optional[dict] = Field(None, description="路由统计: {light_ocr: N, vlm: N, error: N}")

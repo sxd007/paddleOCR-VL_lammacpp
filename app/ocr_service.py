@@ -100,16 +100,17 @@ class OCREngine:
             if task is None:  # 退出信号
                 break
 
-            task_id, input_path, page_size, result_callback, error_callback = task
+            task_id, input_path, page_size, result_callback, error_callback, include = task
             try:
-                result = self._process_internal(router, input_path, page_size)
+                result = self._process_internal(router, input_path, page_size, include=include)
                 result_callback(result)
             except Exception as e:
                 error_callback(e)
             finally:
                 self._task_queue.task_done()
 
-    def _process_internal(self, router: ModelRouter, input_path: str, page_size: int) -> dict:
+    def _process_internal(self, router: ModelRouter, input_path: str, page_size: int,
+                          include: list = None) -> dict:
         """
         在工作者线程中执行实际的 OCR 处理。
         自动识别图片/PDF，并使用 ModelRouter 进行版面分类和路由。
@@ -118,11 +119,11 @@ class OCREngine:
         logger.info(f"处理: 类型={file_type}, 路径={str(file_path)[:80]}...")
 
         if file_type == "pdf":
-            return self._process_pdf(router, file_path, page_size)
+            return self._process_pdf(router, file_path, page_size, include=include)
         else:
-            return self._process_image(router, file_path)
+            return self._process_image(router, file_path, include=include)
 
-    def _process_image(self, router: ModelRouter, image_path: str) -> dict:
+    def _process_image(self, router: ModelRouter, image_path: str, include: list = None) -> dict:
         """处理单张图片 — 通过路由引擎调度"""
         result = router.process_with_route(image_path, routing_enabled=settings.ROUTING_ENABLED)
 
@@ -133,19 +134,18 @@ class OCREngine:
             "file_type": "image",
             "total_pages": 1,
             "total_timing_ms": result.get("timing_ms", 0),
-            "route_summary": {"light_ocr": 1 if route == "light_ocr" else 0, "table": 1 if route == "table" else 0, "vlm": 1 if route == "vlm" else 0, "error": 0},
-            "pages": [{
-                "page": 1,
-                "markdown": result["markdown"],
-                "text": result["text"],
-                "route": route,
-                "timing_ms": result.get("timing_ms", 0),
-                "classification": result.get("classification"),
-            }],
+            "route_summary": {
+                "light_ocr": 1 if route == "light_ocr" else 0,
+                "table": 1 if route == "table" else 0,
+                "vlm": 1 if route == "vlm" else 0,
+                "error": 0,
+            },
+            "pages": [self._build_page_dict(1, result, include=include)],
             "raw": result.get("raw"),
         }
 
-    def _process_pdf(self, router: ModelRouter, pdf_path: str, page_size: int = 20) -> dict:
+    def _process_pdf(self, router: ModelRouter, pdf_path: str, page_size: int = 20,
+                     include: list = None) -> dict:
         """
         处理 PDF 文件 — 两阶段批量优化版。
 
@@ -216,10 +216,14 @@ class OCREngine:
                     route, reason = router.decide_route(cls)
                     logger.info(f"  第 {page_num} 页路由: {route} — {reason}")
                     cls_by_page[page_num] = {
-                        "label": cls.get("label", "unknown"),
+                        "route": route,
                         "detected_complex": cls.get("detected_complex", []),
-                        "blocks": [
-                            {"label": b.get("label", ""), "score": round(b.get("score", 0), 3)}
+                        "layout_blocks": [
+                            {
+                                "label": b.get("label", ""),
+                                "score": round(b.get("score", 0), 3),
+                                "bbox": b.get("coordinate"),
+                            }
                             for b in cls.get("blocks", [])
                         ],
                     }
@@ -242,6 +246,7 @@ class OCREngine:
                         all_results.append({
                             "page": page_num, "markdown": result["markdown"],
                             "text": result["text"], "route": "light_ocr", "raw": result.get("raw"),
+                            "elements": result.get("elements"),
                             "timing_ms": page_timing,
                             "classification": cls_by_page.get(page_num),
                         })
@@ -271,6 +276,7 @@ class OCREngine:
                             all_results.append({
                                 "page": page_num, "markdown": result["markdown"],
                                 "text": result["text"], "route": "vlm", "raw": result.get("raw"),
+                                "elements": result.get("elements"),
                                 "timing_ms": avg_ms,
                             })
                             total_vlm += 1
@@ -285,6 +291,7 @@ class OCREngine:
                                 all_results.append({
                                     "page": page_num, "markdown": result["markdown"],
                                     "text": result["text"], "route": "vlm", "raw": result.get("raw"),
+                                    "elements": result.get("elements"),
                                     "timing_ms": page_timing,
                                 })
                                 total_vlm += 1
@@ -313,10 +320,10 @@ class OCREngine:
                         table_image_paths.append((page_num, str(img_path)))
                         # bbox 坐标从低 DPI 空间缩放到高 DPI 空间
                         cls = cls_by_page.get(page_num, {})
-                        for block in cls.get("blocks", []):
-                            if block.get("label") == "table" and block.get("coordinate"):
+                        for block in cls.get("layout_blocks", []):
+                            if block.get("label") == "table" and block.get("bbox"):
                                 table_bboxes[idx] = [
-                                    int(v * scale_ratio) for v in block["coordinate"]
+                                    int(v * scale_ratio) for v in block["bbox"]
                                 ]
                                 break
                     try:
@@ -330,6 +337,7 @@ class OCREngine:
                             all_results.append({
                                 "page": page_num, "markdown": result["markdown"],
                                 "text": result["text"], "route": "table", "raw": result.get("raw"),
+                                "elements": result.get("elements"),
                                 "timing_ms": avg_ms,
                                 "classification": cls_by_page.get(page_num),
                             })
@@ -346,6 +354,7 @@ class OCREngine:
                                 all_results.append({
                                     "page": page_num, "markdown": result["markdown"],
                                     "text": result["text"], "route": "table", "raw": result.get("raw"),
+                                    "elements": result.get("elements"),
                                     "timing_ms": page_timing,
                                     "classification": cls_by_page.get(page_num),
                                 })
@@ -371,6 +380,7 @@ class OCREngine:
                         all_results.append({
                             "page": page_num, "markdown": result["markdown"],
                             "text": result["text"], "route": "vlm", "raw": result.get("raw"),
+                            "elements": result.get("elements"),
                             "timing_ms": avg_ms,
                             "classification": cls_by_page.get(page_num),
                         })
@@ -386,6 +396,7 @@ class OCREngine:
                             all_results.append({
                                 "page": page_num, "markdown": result["markdown"],
                                 "text": result["text"], "route": "vlm", "raw": result.get("raw"),
+                                "elements": result.get("elements"),
                                 "timing_ms": page_timing,
                                 "classification": cls_by_page.get(page_num),
                             })
@@ -423,6 +434,28 @@ class OCREngine:
                     pass
 
         pdf.close()
+
+        # === 后处理：规范化字段名 + include 过滤 ===
+        _FILTERABLE_KEYS = ("markdown", "text", "elements", "layout_blocks", "hallucination_warnings")
+        for p in all_results:
+            # 旧格式 classification → 拆解为 layout_blocks + detected_complex
+            if "classification" in p:
+                meta = p.pop("classification")
+                if meta:
+                    p.setdefault("layout_blocks", meta.get("layout_blocks"))
+                    p.setdefault("detected_complex", meta.get("detected_complex"))
+            # 确保 elements 存在
+            if "elements" not in p:
+                p["elements"] = []
+            # 补充 error_detail
+            if p.get("route") == "error" and "error_detail" not in p:
+                p["error_detail"] = p.get("error", "unknown")
+            # 按 include 参数过滤
+            if include is not None:
+                for key in list(p.keys()):
+                    if key in _FILTERABLE_KEYS and key not in include:
+                        del p[key]
+
         all_results.sort(key=lambda r: r["page"])
 
         # 路由汇总
@@ -433,7 +466,7 @@ class OCREngine:
             f"错误={total_errors}页, 总耗时={t_total:.1f}s"
         )
 
-        # 合并（含路由信息）
+        # 合并（含页码锚点）
         merged_md = []
         merged_txt = []
         for p in all_results:
@@ -441,9 +474,13 @@ class OCREngine:
             ptxt = (p.get("text") or "").strip()
             route = p.get("route", "")
             if pmd or ptxt:
-                header = f"--- 第 {p['page']} 页 --- [{route}]"
+                header = f"---\n<!-- page {p['page']} | route: {route} -->"
                 merged_md.append(f"{header}\n{pmd}")
                 merged_txt.append(f"{header}\n{ptxt}")
+            # 将 elements 中的 ID 补充为全局格式 p{page}_e{index}
+            for elem in (p.get("elements") or []):
+                if "id" in elem and not elem["id"].startswith("p"):
+                    elem["id"] = f"p{p['page']}_{elem['id']}"
 
         total_ms = sum(p.get("timing_ms", 0) for p in all_results)
         return {
@@ -457,9 +494,53 @@ class OCREngine:
             "raw": [p.get("raw") for p in all_results],
         }
 
+    # ========== 页面构建工具 ==========
+
+    @staticmethod
+    def _build_page_dict(page_num: int, result: dict,
+                         layout_blocks: list = None,
+                         include: list = None) -> dict:
+        """
+        从路由结果构建 OCRResultPage 级字典，按 include 参数控制输出字段。
+
+        Args:
+            page_num: 页码
+            result: 路由结果 dict，应有 markdown, text, elements, route, timing_ms 等
+            layout_blocks: 单独传入的 layout_blocks（PDF批量路径使用 cls_by_page 的）
+            include: 字段过滤列表
+
+        Returns:
+            dict: 符合 OCRResultPage 结构的字典
+        """
+        include = include or ["markdown", "text", "elements", "layout_blocks", "hallucination_warnings"]
+        page = {
+            "page": page_num,
+            "route": result.get("route"),
+            "error_detail": result.get("error_detail"),
+            "timing_ms": result.get("timing_ms", 0),
+        }
+        if "markdown" in include:
+            page["markdown"] = result.get("markdown")
+        if "text" in include:
+            page["text"] = result.get("text")
+        if "elements" in include:
+            elements = result.get("elements")
+            if elements:
+                # 补全 element ID 为全局格式
+                for elem in elements:
+                    if "id" in elem and not elem["id"].startswith("p"):
+                        elem["id"] = f"p{page_num}_{elem['id']}"
+            page["elements"] = elements
+        if "layout_blocks" in include:
+            page["layout_blocks"] = layout_blocks if layout_blocks is not None else result.get("layout_blocks")
+        if "hallucination_warnings" in include:
+            page["hallucination_warnings"] = result.get("hallucination_warnings")
+        return page
+
     # ========== 公共接口 ==========
 
-    def predict(self, image_input: str, page_size: Optional[int] = None, timeout: int = 600) -> dict:
+    def predict(self, image_input: str, page_size: Optional[int] = None,
+                timeout: int = 600, include: Optional[List[str]] = None) -> dict:
         """
         提交 OCR 预测任务并等待结果。
 
@@ -467,6 +548,7 @@ class OCREngine:
             image_input: 图片/PDF的URL、本地路径或Base64编码
             page_size: PDF分页大小（None使用默认值20，-1不拆分）
             timeout: 等待超时秒数
+            include: 按需返回字段列表，不传则全部返回
 
         Returns:
             dict: {markdown, text, file_type, total_pages, pages, raw}
@@ -484,7 +566,7 @@ class OCREngine:
         def on_error(e):
             error_container.append(e)
 
-        self._task_queue.put(("predict", image_input, ps, on_result, on_error))
+        self._task_queue.put(("predict", image_input, ps, on_result, on_error, include))
 
         # 等待结果
         deadline = time.time() + timeout

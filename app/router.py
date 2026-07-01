@@ -175,7 +175,7 @@ class LightweightOCREngine:
         对图片进行文字检测+识别，返回标准格式结果。
 
         Returns:
-            dict: {markdown, text, raw}
+            dict: {markdown, text, elements, raw}
         """
         if self._ocr is None:
             raise RuntimeError("轻量 OCR 未加载，请先调用 load()")
@@ -185,29 +185,32 @@ class LightweightOCREngine:
         elapsed = time.time() - t0
         logger.debug(f"轻量OCR推理耗时: {elapsed:.2f}秒")
 
-        markdown = self._ocr_to_markdown(raw_results)
-        text = self._strip_markdown(markdown)
+        elements = self._ocr_to_elements(raw_results)
+        markdown = self._elements_to_markdown(elements)
+        text = self._elements_to_text(elements)
 
-        return {"markdown": markdown, "text": text, "raw": raw_results}
+        return {"markdown": markdown, "text": text, "elements": elements, "raw": raw_results}
 
     @staticmethod
-    def _ocr_to_markdown(ocr_results: list) -> str:
+    def _ocr_to_elements(ocr_results: list) -> list:
         """
-        将 PaddleOCR(det+rec) 结果转换为 markdown。
+        将 PaddleOCR(det+rec) 结果转换为 element 列表（按阅读顺序排序）。
+
         输入格式: [[(polygon, (text, confidence)), ...], ...]
-        输出: 按行排序的段落文本
+        输出: list[dict] with keys:
+            id, type="paragraph", reading_order, bbox, confidence, content={"text": str}
         """
         if not ocr_results or not ocr_results[0]:
-            return ""
+            return []
 
-        lines = []
+        lines = []  # [(center_y, center_x, bbox, text, confidence), ...]
         for item in ocr_results[0]:
             if not isinstance(item, (list, tuple)) or len(item) < 2:
                 continue
             box, rec = item
             if isinstance(rec, (list, tuple)):
                 text = rec[0] if rec else ""
-                confidence = rec[1] if len(rec) > 1 else 1.0
+                confidence = float(rec[1]) if len(rec) > 1 else 1.0
             else:
                 text, confidence = str(rec), 1.0
 
@@ -215,43 +218,85 @@ class LightweightOCREngine:
                 continue
 
             if isinstance(box, (list, tuple)) and len(box) >= 4:
-                ys = [p[1] if isinstance(p, (list, tuple)) else 0 for p in box[:4]]
                 xs = [p[0] if isinstance(p, (list, tuple)) else 0 for p in box[:4]]
+                ys = [p[1] if isinstance(p, (list, tuple)) else 0 for p in box[:4]]
+                bbox = [min(xs), min(ys), max(xs), max(ys)]  # polygon → 外接矩形
                 center_y = sum(ys) / len(ys)
                 center_x = sum(xs) / len(xs)
             else:
-                center_y, center_x = 0, 0
+                bbox, center_y, center_x = None, 0, 0
 
-            lines.append((center_y, center_x, text))
+            lines.append((center_y, center_x, bbox, text, confidence))
 
         if not lines:
+            return []
+
+        # 按阅读顺序排序（先按y行、再按x列）
+        lines.sort(key=lambda x: (x[0], x[1]))
+        elements = []
+        for order, (_, _, bbox, text, confidence) in enumerate(lines):
+            elements.append({
+                "id": f"e{order}",
+                "type": "paragraph",
+                "reading_order": order,
+                "bbox": bbox,
+                "confidence": round(confidence, 4),
+                "content": {"text": text},
+            })
+        return elements
+
+    @staticmethod
+    def _elements_to_markdown(elements: list) -> str:
+        """
+        将 elements 按行分组（20px容差）合成为 markdown 段落。
+        同一行内的元素按x排序后用空格拼接，行间用双换行分隔。
+        """
+        if not elements:
             return ""
 
-        lines.sort(key=lambda x: (x[0], x[1]))
+        sorted_elems = sorted(elements, key=lambda e: e.get("reading_order", 0))
+        if not sorted_elems:
+            return ""
+
+        def _get_center_y(elem):
+            bbox = elem.get("bbox")
+            if bbox and len(bbox) >= 4:
+                return (bbox[1] + bbox[3]) / 2
+            return 0
+
         rows = []
-        current_row_y = lines[0][0]
-        current_row = []
-        for center_y, center_x, text in lines:
-            if abs(center_y - current_row_y) > 20:
-                current_row.sort(key=lambda x: x[1])
-                rows.append(" ".join(t for _, _, t in current_row))
-                current_row = [(center_y, center_x, text)]
-                current_row_y = center_y
+        current_row_y = _get_center_y(sorted_elems[0])
+        current_row = [sorted_elems[0]]
+        for elem in sorted_elems[1:]:
+            cy = _get_center_y(elem)
+            if abs(cy - current_row_y) <= 20:
+                current_row.append(elem)
             else:
-                current_row.append((center_y, center_x, text))
+                rows.append(current_row)
+                current_row = [elem]
+                current_row_y = cy
+        rows.append(current_row)
 
-        if current_row:
-            current_row.sort(key=lambda x: x[1])
-            rows.append(" ".join(t for _, _, t in current_row))
+        # 每行内按 x 排序，拼接为段落
+        paragraphs = []
+        for row in rows:
+            row.sort(key=lambda e: (e.get("bbox") or [0, 0, 0, 0])[0])
+            text_segments = [e.get("content", {}).get("text", "") for e in row if e.get("content", {}).get("text")]
+            if text_segments:
+                paragraphs.append(" ".join(text_segments))
 
-        result = "\n\n".join(rows)
-        # 清理多余空格行
+        result = "\n\n".join(paragraphs)
         return re.sub(r" +\n", "\n", result).strip()
 
     @staticmethod
-    def _strip_markdown(markdown: str) -> str:
-        text = re.sub(r"[#*_`\[\]()>|~-]", "", markdown)
-        return re.sub(r"\n{3,}", "\n\n", text).strip()
+    def _elements_to_text(elements: list) -> str:
+        """将 elements 按 reading_order 合成为纯文本，每元素一行"""
+        texts = [
+            e.get("content", {}).get("text", "")
+            for e in sorted(elements, key=lambda e: e.get("reading_order", 0))
+            if e.get("content", {}).get("text")
+        ]
+        return "\n".join(texts)
 
     def warmup(self):
         """预热推理"""
@@ -292,16 +337,22 @@ class TableRecognitionEngine:
         elapsed = time.time() - t0
         logger.info(f"PP-StructureV3 加载完成，耗时: {elapsed:.1f}秒")
 
-    def predict(self, image_path: str) -> dict:
+    def predict(self, image_path: str, table_bbox: list = None) -> dict:
         """
         对图片进行表格结构化识别。
 
         PP-StructureV3 返回 PaddleX pipeline 格式结果。
         递归搜索所有字段，提取 HTML 表格和文本内容。
 
+        Args:
+            image_path: 图片路径
+            table_bbox: 可选，表格区域 bbox [x1,y1,x2,y2]，用于 elements 位置标注。
+                        多表格同页时仅第一张表能拿到准确 bbox，其余为 None（已知局限）。
+
         Returns:
-            dict: {markdown, text, raw}
+            dict: {markdown, text, elements, raw}
                 markdown 中包含 Markdown/HTML 表格
+                elements 为结构化元素列表（table / paragraph）
         """
         if self._engine is None:
             raise RuntimeError("表格识别引擎未加载")
@@ -364,8 +415,37 @@ class TableRecognitionEngine:
             else:
                 markdown = text_repr[:2000] if len(text_repr) > 2000 else text_repr
 
-        text = re.sub(r"<[^>]+>", "", markdown).strip()
-        return {"markdown": markdown, "text": text, "raw": raw_results}
+        # 构建结构化 elements
+        elements = []
+        seen_table_type = False  # 仅第一个表格用传入的 table_bbox（多表格局限）
+        for order, (content, _) in enumerate(parts):
+            is_table = bool(
+                content.strip().startswith("<table") or "<tr>" in content or "<td>" in content
+            )
+            if is_table:
+                bbox = table_bbox if not seen_table_type else None
+                seen_table_type = True
+                elements.append({
+                    "id": f"e{order}",
+                    "type": "table",
+                    "reading_order": order,
+                    "bbox": bbox,
+                    "confidence": None,
+                    "content": {"html": content},
+                })
+            else:
+                elements.append({
+                    "id": f"e{order}",
+                    "type": "paragraph",
+                    "reading_order": order,
+                    "bbox": None,
+                    "confidence": None,
+                    "content": {"text": content},
+                })
+
+        # 修复 text 字段：表格单元格间插入分隔符（\t），行间插入换行
+        text = _table_elements_to_text(elements)
+        return {"markdown": markdown, "text": text, "elements": elements, "raw": raw_results}
 
     def predict_batch(self, image_paths: list, concurrency: int = 4) -> list:
         """批量表格识别 — 线程池并发"""
@@ -399,6 +479,38 @@ class TableRecognitionEngine:
             logger.info("PP-Structure 预热完成")
         except Exception as e:
             logger.warning(f"PP-Structure 预热未完成: {e}")
+
+
+def _table_elements_to_text(elements: list) -> str:
+    """
+    将 elements 合成为纯文本，表格元素的行/cell之间插入分隔符避免乱码。
+
+    普通 paragraph 元素：原样输出。
+    表格元素（type=table）：将 HTML 解析为行/列，
+        同一行 cell 间用 \\t 分隔，行间用 \\n 分隔。
+    """
+    if not elements:
+        return ""
+
+    parts = []
+    for e in elements:
+        if e.get("type") == "table":
+            html = e.get("content", {}).get("html", "")
+            if not html:
+                continue
+            rows = re.findall(r"<tr[^>]*>(.*?)</tr>", html, re.DOTALL | re.IGNORECASE)
+            row_texts = []
+            for row in rows:
+                cells = re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", row, re.DOTALL | re.IGNORECASE)
+                cell_texts = [re.sub(r"<[^>]+>", "", c).strip() for c in cells]
+                row_texts.append("\t".join(cell_texts))
+            parts.append("\n".join(row_texts))
+        else:
+            t = e.get("content", {}).get("text", "")
+            if t:
+                parts.append(t)
+
+    return "\n\n".join(p for p in parts if p).strip()
 
 
 class FastDeployClient:
@@ -719,40 +831,52 @@ class ModelRouter:
             return "light_ocr", "纯文字页面"
 
     def predict_vlm(self, image_path: str, task_type: str = "text") -> dict:
-        """使用配置的 VLM 后端处理页面"""
+        """使用配置的 VLM 后端处理页面。返回带 page-level 元素的完整结果。"""
         # 图像预处理：方向校正（如果启用）
         processed_path = self._preprocess_image(image_path)
 
         if self.vlm_backend == "fastdeploy":
             result = self._fastdeploy_client.predict(processed_path, task_type=task_type)
             md = result["markdown"]
-            return {"markdown": md, "text": self._extract_text_from_vlm(md), "raw": result.get("raw")}
+            out = {"markdown": md, "text": self._extract_text_from_vlm(md), "raw": result.get("raw")}
         elif self.vlm_backend == "llamacpp":
             result = self._llama_client.predict(processed_path, task_type=task_type)
             md = result["markdown"]
-            return {"markdown": md, "text": self._extract_text_from_vlm(md), "raw": result.get("raw")}
+            out = {"markdown": md, "text": self._extract_text_from_vlm(md), "raw": result.get("raw")}
         else:
             if self._vl_pipeline is None:
                 raise RuntimeError("PaddleOCR-VL 未加载")
             result = self._vl_pipeline.predict(processed_path)
             md = self._extract_markdown(result)
-            return {"markdown": md, "text": self._extract_text_from_vlm(md), "raw": result}
+            out = {"markdown": md, "text": self._extract_text_from_vlm(md), "raw": result}
+
+        # VLM 路由诚实降级为 page-level 单元素
+        if "elements" not in out:
+            out["elements"] = [{
+                "id": "e0",
+                "type": "page_text",
+                "reading_order": 0,
+                "bbox": None,
+                "confidence": None,
+                "content": {"text": out.get("text", "")},
+            }]
+        return out
 
     def predict_vlm_batch(self, image_paths: list, task_type: str = "text") -> list:
         """
-        批量 VLM 预测。
+        批量 VLM 预测，每页结果均含 page-level 元素。
 
         Args:
             image_paths: 图片路径列表
             task_type: 任务类型（按路由决定）
 
         Returns:
-            list[dict]: 每个元素格式与 predict_vlm() 一致
+            list[dict]: 每个元素格式与 predict_vlm() 一致（含 elements）
         """
         if self.vlm_backend == "fastdeploy":
-            return self._fastdeploy_client.predict_batch(image_paths, task_type=task_type)
+            results = self._fastdeploy_client.predict_batch(image_paths, task_type=task_type)
         elif self.vlm_backend == "llamacpp":
-            return self._llama_client.predict_batch(
+            results = self._llama_client.predict_batch(
                 image_paths, task_type=task_type, concurrency=settings.MAX_CONCURRENT,
             )
         else:
@@ -764,18 +888,30 @@ class ModelRouter:
             if raw_results and isinstance(raw_results[0], list):
                 raw_results = [r[0] if r else {} for r in raw_results]
 
-            processed = []
+            results = []
             for result in raw_results:
                 if not result:
-                    processed.append({"markdown": "", "text": "", "raw": None})
+                    results.append({"markdown": "", "text": "", "raw": None})
                     continue
                 md = self._extract_markdown(result)
-                processed.append({
+                results.append({
                     "markdown": md,
                     "text": self._extract_text_from_vlm(md),
                     "raw": result,
                 })
-            return processed
+
+        # 统一补全 page-level 元素
+        for out in results:
+            if "elements" not in out:
+                out["elements"] = [{
+                    "id": "e0",
+                    "type": "page_text",
+                    "reading_order": 0,
+                    "bbox": None,
+                    "confidence": None,
+                    "content": {"text": out.get("text", "")},
+                }]
+        return results
 
     def predict_light_ocr(self, image_path: str) -> dict:
         """使用轻量 OCR 处理页面"""
@@ -841,21 +977,32 @@ class ModelRouter:
         """
         if self._table_engine is None:
             logger.warning("表格引擎不可用，回退到 VLM")
-            return self.predict_vlm(image_path, task_type="table")
+            vlm_result = self.predict_vlm(image_path, task_type="table")
+            # VLM 回退时补上 page-level 单元素
+            if "elements" not in vlm_result:
+                vlm_result["elements"] = [{
+                    "id": "e0",
+                    "type": "table",
+                    "reading_order": 0,
+                    "bbox": table_bbox,
+                    "confidence": None,
+                    "content": {"html": vlm_result.get("text", "")},
+                }]
+            return vlm_result
         # 先校正方向
         processed_path = self._preprocess_image(image_path)
 
         # 如果有表格边界框，裁剪+放大表格区域送给表格引擎
         if table_bbox:
             zoomed_path = self._zoom_table_region(processed_path, bbox=table_bbox, scale=3)
-            result = self._table_engine.predict(zoomed_path)
+            result = self._table_engine.predict(zoomed_path, table_bbox=table_bbox)
             md = (result.get("markdown") or "").strip()
             txt = (result.get("text") or "").strip()
             if md or txt:
                 logger.info(f"表格区域裁剪放大（3x）识别成功")
                 return result
             logger.info("表格区域识别为空，回退到整页表格引擎")
-            result = self._table_engine.predict(processed_path)
+            result = self._table_engine.predict(processed_path, table_bbox=table_bbox)
         else:
             result = self._table_engine.predict(processed_path)
 
@@ -865,7 +1012,18 @@ class ModelRouter:
             logger.info("表格引擎输出为空，4x 放大校正后图片再走 VLM（表识前缀）")
             # 在已校正的图片上整图放大
             upscaled = self._upscale_image(processed_path, scale=4)
-            return self.predict_vlm(upscaled, task_type="table")
+            vlm_result = self.predict_vlm(upscaled, task_type="table")
+            # VLM 回退时补上 page-level 单元素
+            if "elements" not in vlm_result:
+                vlm_result["elements"] = [{
+                    "id": "e0",
+                    "type": "table",
+                    "reading_order": 0,
+                    "bbox": table_bbox,
+                    "confidence": None,
+                    "content": {"html": vlm_result.get("text", "")},
+                }]
+            return vlm_result
         return result
 
     def predict_table_batch(self, image_paths: list, table_bboxes: dict = None) -> list:
@@ -897,9 +1055,19 @@ class ModelRouter:
             results = self._table_engine.predict_batch(zoomed_paths)
         else:
             results = self._table_engine.predict_batch(processed)
+
+        # 将 bbox 回填到 elements 中
+        if table_bboxes:
+            for i, result in enumerate(results):
+                if result and table_bboxes.get(i):
+                    bbox = table_bboxes[i]
+                    for elem in result.get("elements", []):
+                        if elem.get("type") == "table" and elem.get("bbox") is None:
+                            elem["bbox"] = bbox
+
         for i in range(len(results)):
             if results[i] is None:
-                results[i] = {"markdown": "", "text": ""}
+                results[i] = {"markdown": "", "text": "", "elements": []}
             md = (results[i].get("markdown") or "").strip()
             txt = (results[i].get("text") or "").strip()
             if not md and not txt:
@@ -913,7 +1081,8 @@ class ModelRouter:
         完整处理流程：分类 → 路由 → 识别。
 
         Returns:
-            dict: 统一格式 {markdown, text, raw, route, route_reason, timing_ms}
+            dict: 统一格式 {markdown, text, elements, layout_blocks, raw,
+                   route, route_reason, detected_complex, timing_ms}
         """
         t_start = time.time()
 
@@ -921,6 +1090,17 @@ class ModelRouter:
             result = self.predict_vlm(image_path, task_type="text")
             result["route"] = "vlm"
             result["route_reason"] = "路由关闭"
+            # VLM 路由诚实降级为 page-level 单元素
+            if "elements" not in result:
+                result["elements"] = [{
+                    "id": "e0",
+                    "type": "page_text",
+                    "reading_order": 0,
+                    "bbox": None,
+                    "confidence": None,
+                    "content": {"text": result.get("text", "")},
+                }]
+            result["layout_blocks"] = []
             result["timing_ms"] = int((time.time() - t_start) * 1000)
             return result
 
@@ -931,6 +1111,7 @@ class ModelRouter:
         # 2. 路由决策
         route, reason = self.decide_route(classification)
         logger.info(f"路由决策: {route} — {reason}")
+        detected_complex = classification.get("detected_complex", [])
 
         # 提取表格框坐标（用于裁剪放大）
         table_bbox = None
@@ -944,30 +1125,39 @@ class ModelRouter:
             result = self.predict_table(image_path, table_bbox=table_bbox)
         elif route == "vlm":
             # 根据检测到的元素类型选择前缀
-            detected = classification.get("detected_complex", [])
-            if any(t in detected for t in ("formula", "display_formula", "inline_formula")):
+            if any(t in detected_complex for t in ("formula", "display_formula", "inline_formula")):
                 vlm_task = "formula"
-            elif "chart" in detected:
+            elif "chart" in detected_complex:
                 vlm_task = "chart"
-            elif "seal" in detected:
+            elif "seal" in detected_complex:
                 vlm_task = "seal"
             else:
                 vlm_task = "text"  # OCR: 通用文字提取
             result = self.predict_vlm(image_path, task_type=vlm_task)
+            # VLM 路由诚实降级为 page-level 单元素（覆盖 predict_vlm 的默认 page_text）
+            result["elements"] = [{
+                "id": "e0",
+                "type": vlm_task if vlm_task != "text" else "page_text",
+                "reading_order": 0,
+                "bbox": None,
+                "confidence": None,
+                "content": {"text": result.get("text", "")},
+            }]
         else:
-            result = self.predict_light_ocr(image_path)
+            result = self.predict_light_ocr(image_path)  # 已在引擎中自带 elements
         t_done = time.time()
 
         result["route"] = route
         result["route_reason"] = reason
-        result["classification"] = {
-            "label": classification.get("label", "unknown"),
-            "detected_complex": classification.get("detected_complex", []),
-            "blocks": [
-                {"label": b.get("label", ""), "score": round(b.get("score", 0), 3)}
-                for b in classification.get("blocks", [])
-            ],
-        }
+        result["detected_complex"] = detected_complex
+        result["layout_blocks"] = [
+            {
+                "label": b.get("label", ""),
+                "score": round(b.get("score", 0), 3),
+                "bbox": b.get("coordinate"),
+            }
+            for b in classification.get("blocks", [])
+        ]
         result["timing_ms"] = int((t_done - t_start) * 1000)
         result["timing_breakdown"] = {
             "classification_ms": int((t_classified - t_start) * 1000),
@@ -978,6 +1168,16 @@ class ModelRouter:
         if warnings and route in ("vlm", "table"):
             logger.warning(f"检测到幻觉 ({warnings[0][:60]}...)，使用默认前缀重试")
             result = self.predict_vlm(image_path, task_type="text")
+            # 重试结果也加上 page-level 元素
+            if "elements" not in result:
+                result["elements"] = [{
+                    "id": "e0",
+                    "type": "page_text",
+                    "reading_order": 0,
+                    "bbox": None,
+                    "confidence": None,
+                    "content": {"text": result.get("text", "")},
+                }]
             t_retry = time.time()
             retry_warnings = self._detect_hallucinations(result.get("markdown", ""))
             if retry_warnings:

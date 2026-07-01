@@ -23,7 +23,7 @@ from .auth import APIKeyMiddleware
 from .ocr_service import engine
 from .models import (
     OCRRequest, OCRBatchRequest, OCRResponse, OCRBatchResponse,
-    OCRResultItem, HealthResponse, ModelInfo,
+    OCRResultItem, OCRResultPage, Element, HealthResponse, ModelInfo,
 )
 
 # 日志配置
@@ -153,19 +153,20 @@ def ocr_single(request: OCRRequest, req: Request):
         )
 
     try:
-        result = engine.predict(request.image, page_size=request.page_size)
+        result = engine.predict(request.image, page_size=request.page_size, include=request.include)
 
         page_items = None
         if result.get("pages"):
-            from .models import OCRResultPage
             page_items = [
                 OCRResultPage(
                     page=p["page"],
                     markdown=p.get("markdown"),
                     text=p.get("text"),
+                    elements=[Element(**e) for e in (p.get("elements") or [])] if p.get("elements") else None,
+                    layout_blocks=p.get("layout_blocks"),
                     route=p.get("route"),
+                    error_detail=p.get("error_detail"),
                     timing_ms=p.get("timing_ms"),
-                    classification=p.get("classification"),
                     hallucination_warnings=p.get("hallucination_warnings"),
                 )
                 for p in result["pages"]
@@ -225,18 +226,21 @@ def ocr_batch(request: OCRBatchRequest, req: Request):
 
     for idx, item in enumerate(request.images):
         try:
-            result = engine.predict(item.image, page_size=item.page_size)
+            result = engine.predict(item.image, page_size=item.page_size, include=item.include)
 
             page_items = None
             if result.get("pages"):
-                from .models import OCRResultPage
                 page_items = [
                     OCRResultPage(
                         page=p["page"],
                         markdown=p.get("markdown"),
                         text=p.get("text"),
+                        elements=[Element(**e) for e in (p.get("elements") or [])] if p.get("elements") else None,
+                        layout_blocks=p.get("layout_blocks"),
                         route=p.get("route"),
+                        error_detail=p.get("error_detail"),
                         timing_ms=p.get("timing_ms"),
+                        hallucination_warnings=p.get("hallucination_warnings"),
                     )
                     for p in result["pages"]
                 ]
