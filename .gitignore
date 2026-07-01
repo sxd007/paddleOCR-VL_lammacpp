@@ -1,0 +1,88 @@
+# ============================================================================
+# Python
+# ============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
+# ============================================================================
+# Virtual Environment
+# ============================================================================
+.venv/
+venv/
+env/
+
+# ============================================================================
+# Environment / Secrets — DO NOT COMMIT
+# ============================================================================
+.env
+.env.local
+.env.prod
+.env.development
+
+# ============================================================================
+# IDE / Editor
+# ============================================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ============================================================================
+# Project-specific: Docker build artifacts
+# ============================================================================
+# Precompiled llama.cpp binaries (regenerated from source)
+docker/llama-cli
+docker/llama-server
+docker/libggml*.so*
+docker/libllama*.so*
+docker/libmtmd*.so*
+docker/libllava*.so*
+docker/libllama-server-impl*.so*
+
+# Paddle wheel archive (3.7GB, used only for Docker build cache)
+docker/paddle-wheels/paddle-packages.tar.gz
+
+# Old/unused llama.cpp source tree (5.9GB)
+docker/llama.cpp-src.old/
+
+# llama.cpp source tree (embedded git repo, ~2GB)
+docker/llama.cpp-src/
+docker/llama.cpp-src/build/
+
+# CUDA keyring package
+cuda-keyring_*.deb
+
+# Model cache directory (downloaded at runtime)
+**/.paddlex/
+
+# GGUF model files (should be downloaded separately)
+*.gguf
+
+# ============================================================================
+# Machine-specific: Claude config & plan documents
+# ============================================================================
+.claude/
+docs/plan/
+
+# ============================================================================
+# Temporary / runtime files
+# ============================================================================
+/tmp/paddleocr_vl_*/
+/tmp/paddleocr_vl_warmup*
+/tmp/paddleocr_vl_uploads*
+/tmp/paddleocr_vl_pages/
+
+# OS files
+Thumbs.db

@@ -1,0 +1,77 @@
+# ============================================================================
+# llama.cpp — PaddleOCR-VL-1.6 GGUF 推理服务（预编译二进制版）
+# ============================================================================
+# 此镜像不编译任何代码，只 COPY 宿主机上预编译好的 llama-server/cli 二进制。
+# 构建极快、零编译负载，彻底避免 80 核 + GPU 编译导致的系统卡死。
+#
+# 前提：宿主机上已用如下命令编译好二进制：
+#   cd llama.cpp-src && cmake -B build -DGGML_CUDA=ON && cmake --build build -j8
+#
+# 模型: PaddleOCR-VL-1.6-GGUF
+# 来源: https://github.com/AuditAIH/PPOCR-VL1.6-llama.cpp
+# ============================================================================
+
+FROM nvidia/cuda:12.8.0-runtime-ubuntu22.04
+
+LABEL maintainer="PaddleOCR-VL"
+LABEL description="llama.cpp PaddleOCR-VL-1.6-GGUF 推理服务 (预编译二进制)"
+LABEL version="1.0.0"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 仅需 curl + libgomp1（OpenMP 运行时）
+RUN sed -i 's|http://archive.ubuntu.com|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list && \
+    sed -i 's|http://security.ubuntu.com|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list && \
+    echo 'Acquire::By-Hash "no";' > /etc/apt/apt.conf.d/99-disable-by-hash && \
+    rm -rf /var/lib/apt/lists/* && \
+    apt-get update -o Acquire::Retries=3 && \
+    apt-get install -y --no-install-recommends \
+        curl \
+        libgomp1 \
+        && \
+    rm -rf /var/lib/apt/lists/*
+
+# COPY 宿主机预编译的二进制 + 共享库（跳过源码编译，构建秒完成）
+# 二进制和 .so 从 llama.cpp-src/build/bin/ 复制到 docker/ 目录下
+COPY llama-server /usr/local/bin/llama-server
+COPY llama-cli /usr/local/bin/llama-cli
+# 新版使用版本化 .so + impl 插件架构
+COPY libllama-server-impl.so \
+     libllama-common.so libllama-common.so.0 libllama-common.so.0.0.1 \
+     libllama.so libllama.so.0 libllama.so.0.0.1 \
+     libggml.so libggml.so.0 libggml.so.0.15.1 \
+     libggml-base.so libggml-base.so.0 libggml-base.so.0.15.1 \
+     libggml-cpu.so libggml-cpu.so.0 libggml-cpu.so.0.15.1 \
+     libggml-cuda.so libggml-cuda.so.0 libggml-cuda.so.0.15.1 \
+     libmtmd.so libmtmd.so.0 libmtmd.so.0.0.1 \
+     /usr/local/lib/
+
+# 配置共享库路径（llama 自定义库 + CUDA 运行时库）
+ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/local/cuda/targets/x86_64-linux/lib:/usr/local/cuda/lib64
+
+# 模型目录
+RUN mkdir -p /models
+
+# 验证
+RUN ldconfig && llama-server --version 2>&1 || true
+
+EXPOSE 8118
+
+# 健康检查
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=120s \
+    CMD curl -f http://localhost:8118/health || exit 1
+
+# ============================================================================
+# 启动命令
+# ============================================================================
+ENTRYPOINT ["llama-server"]
+CMD ["-m", "/models/PaddleOCR-VL-1.6-GGUF.gguf", \
+     "--mmproj", "/models/PaddleOCR-VL-1.6-GGUF-mmproj.gguf", \
+     "--port", "8118", \
+     "--host", "0.0.0.0", \
+     "--temp", "0", \
+     "--parallel", "12", \
+     "--flash-attn", "on", \
+     "-b", "2048", \
+     "--cache-type-k", "q8_0", \
+     "--cache-type-v", "q8_0"]

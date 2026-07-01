@@ -1,0 +1,39 @@
+# ============================================================================
+# PaddleOCR-VL Enterprise API Service — Python Dependencies
+# ============================================================================
+# For non-Docker deployment. Docker users: see docker/Dockerfile.app
+#
+# Install:
+#   pip install -r requirements.txt
+#
+# NOTE: PaddlePaddle 3.x has unified the package name to "paddlepaddle"
+# (no separate GPU variant). CUDA must be installed separately.
+# ============================================================================
+
+# ---- Core framework ----
+fastapi>=0.136.0
+uvicorn>=0.49.0
+pydantic>=2.13.0
+pydantic_core>=2.46.0
+python-multipart>=0.0.32
+
+# ---- PaddlePaddle ecosystem ----
+# ⚠️ If installing from official PyPI, use:
+#   paddlepaddle==3.2.1
+#
+# ⚠️ If installing from PaddlePaddle's own index (CUDA 12.6):
+#   pip install paddlepaddle==3.2.1 -f https://www.paddlepaddle.org.cn/whl/linux/cu126/stable.html
+paddlepaddle==3.2.1
+paddleocr==3.6.0
+paddlex[ocr]==3.6.1
+
+# ---- Document processing ----
+pypdfium2>=5.9.0
+Pillow>=12.1.0
+numpy>=2.2.6
+
+# ---- HTTP client (llama.cpp / FastDeploy) ----
+requests>=2.32.0
+
+# ---- Development / debugging ----
+# python-dotenv    # (optional) if you prefer python-dotenv over built-in loader

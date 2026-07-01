@@ -1,0 +1,74 @@
+# ============================================================================
+# PaddleOCR-VL + llama.cpp GGUF — Docker Compose
+# ============================================================================
+# 架构:
+#   llama-ocr       ←  PaddleOCR-VL-1.6-GGUF 推理服务 (llama.cpp)
+#   paddleocr-app   ←  FastAPI 路由服务 (PP-DocLayoutV3 + PP-OCRv5)
+#
+# 启动: docker compose up -d
+# 查看日志: docker compose logs -f
+# 停止: docker compose down
+# ============================================================================
+
+services:
+
+  # ---- llama.cpp VLM 推理服务 -----------------------------------------------
+  llama-ocr:
+    build:
+      context: .
+      dockerfile: Dockerfile.llama
+    container_name: paddleocr-llama
+    ports:
+      - "8118:8118"
+    # 端口绑定到所有接口，Cherry Studio 等客户端可远程访问
+    # 注意: llama-server 无内置鉴权，建议内网使用或配合 nginx 反向代理
+    volumes:
+      # GGUF 模型目录（主机上存放 PaddleOCR-VL-1.6-GGUF.gguf 和 mmproj）
+      - /home/alpha/.paddlex/official_models/ppocr-vl-gguf:/models
+    # docker-compose v1 使用 runtime + env 而非 deploy.resources 来启用 GPU
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - TZ=Asia/Shanghai
+    shm_size: 8g
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8118/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  # ---- FastAPI 路由服务 ----------------------------------------------------
+  paddleocr-app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.app
+    container_name: paddleocr-app
+    ports:
+      - "8086:8086"
+    depends_on:
+      llama-ocr:
+        condition: service_healthy
+    volumes:
+      # 模型缓存（PP-DocLayoutV3, PP-OCRv5, PaddleX）
+      - /home/alpha/.paddlex:/root/.paddlex
+      # 使用 docker/ 自己的 .env，不依赖父目录配置
+      - ./.env:/app/.env:ro
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - VLM_BACKEND=llamacpp
+      - LLAMACPP_URL=http://llama-ocr:8118
+      - PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
+      - TZ=Asia/Shanghai
+    shm_size: 1g
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8086/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
