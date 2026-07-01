@@ -310,14 +310,14 @@ class TableRecognitionEngine:
         raw_results = self._engine.predict(image_path)
         elapsed = time.time() - t0
 
-        # 递归提取 HTML 表格和文本
-        parts = []
+        # 递归提取 HTML 表格和文本，保留空间位置信息用于排序
+        parts = []  # [(content, y_position), ...]
         def _extract(obj, depth=0):
             if depth > 5 or obj is None:
                 return
             if isinstance(obj, str):
                 if obj.strip().startswith("<table") or "<tr>" in obj or "<td>" in obj:
-                    parts.append(obj.strip())
+                    parts.append((obj.strip(), depth * 1000))
                 return
             if isinstance(obj, (list, tuple)):
                 for item in obj:
@@ -327,22 +327,34 @@ class TableRecognitionEngine:
                 # 直接命中的 key
                 html = obj.get("html", "")
                 if html and isinstance(html, str) and ("<table" in html or "<tr>" in html):
-                    parts.append(html)
+                    # 尝试获取空间位置（bbox）用于排序
+                    y_pos = _get_bbox_y(obj) or depth * 1000
+                    parts.append((html, y_pos))
                     return
                 txt = obj.get("text", "")
                 if txt and isinstance(txt, str) and len(txt) > 5 and not parts:
-                    parts.append(txt)
+                    parts.append((txt, depth * 1000))
                 md = obj.get("markdown", "")
                 if md and isinstance(md, str) and len(md) > 5 and not parts:
-                    parts.append(md)
+                    parts.append((md, depth * 1000))
                 # 递归所有字段
                 for v in obj.values():
                     _extract(v, depth + 1)
 
+        def _get_bbox_y(block: dict, default: int = 0) -> int:
+            """尝试从 block 中提取 bbox 的 y 坐标用于排序"""
+            for key in ("bbox", "box", "coordinate", "polygon"):
+                val = block.get(key)
+                if val and isinstance(val, (list, tuple)) and len(val) >= 2:
+                    return int(val[1])  # y_min / top
+            return default
+
         _extract(raw_results)
 
         if parts:
-            markdown = "\n\n".join(parts).strip()
+            # 按 y 坐标排序（从上到下），保证阅读顺序
+            parts.sort(key=lambda x: x[1])
+            markdown = "\n\n".join(content for content, _ in parts).strip()
         else:
             # 最后兜底：取字符串中所有 <table>...</table>
             text_repr = str(raw_results)
@@ -357,6 +369,7 @@ class TableRecognitionEngine:
 
     def predict_batch(self, image_paths: list, concurrency: int = 4) -> list:
         """批量表格识别 — 线程池并发"""
+        concurrency = settings.MAX_CONCURRENT  # 实际值从 .env 的 MAX_CONCURRENT 读取
         from concurrent.futures import ThreadPoolExecutor, as_completed
         results = [None] * len(image_paths)
 
@@ -438,7 +451,16 @@ class FastDeployClient:
         except Exception as e:
             logger.warning(f"FastDeploy 预热未完成: {e}")
 
-    def predict(self, image_path: str) -> dict:
+    # 官方任务前缀（PaddleOCR-VL-1.6 专用短前缀）
+    PROMPTS = {
+        "text": "OCR:",
+        "table": "Table Recognition:",
+        "formula": "Formula Recognition:",
+        "chart": "Chart Recognition:",
+        "seal": "Seal Recognition:",
+    }
+
+    def predict(self, image_path: str, task_type: str = "text") -> dict:
         """单图 VLM 推理 — 通过 HTTP 调用 FastDeploy"""
         import requests
 
@@ -446,10 +468,7 @@ class FastDeployClient:
             img_data = f.read()
         img_b64 = base64.b64encode(img_data).decode()
 
-        prompt = (
-            "请完整提取图片中的所有文字内容，保持原始段落结构和排版层次。"
-            "输出格式：纯markdown，标题用#，表格用html，段落间空行分隔。"
-        )
+        prompt = self.PROMPTS.get(task_type, "OCR:")
 
         try:
             resp = requests.post(
@@ -487,12 +506,12 @@ class FastDeployClient:
             logger.error(f"FastDeploy API 调用失败: {e}")
             raise
 
-    def predict_batch(self, image_paths: list) -> list:
+    def predict_batch(self, image_paths: list, task_type: str = "text") -> list:
         """批量推理 — 逐张调用（后续可优化为真正的 batch 请求）"""
         results = []
         for path in image_paths:
             try:
-                result = self.predict(path)
+                result = self.predict(path, task_type=task_type)
                 results.append(result)
             except Exception as e:
                 logger.error(f"FastDeploy 批量处理失败 ({path}): {e}")
@@ -699,17 +718,17 @@ class ModelRouter:
         else:
             return "light_ocr", "纯文字页面"
 
-    def predict_vlm(self, image_path: str) -> dict:
+    def predict_vlm(self, image_path: str, task_type: str = "text") -> dict:
         """使用配置的 VLM 后端处理页面"""
         # 图像预处理：方向校正（如果启用）
         processed_path = self._preprocess_image(image_path)
 
         if self.vlm_backend == "fastdeploy":
-            result = self._fastdeploy_client.predict(processed_path)
+            result = self._fastdeploy_client.predict(processed_path, task_type=task_type)
             md = result["markdown"]
             return {"markdown": md, "text": self._extract_text_from_vlm(md), "raw": result.get("raw")}
         elif self.vlm_backend == "llamacpp":
-            result = self._llama_client.predict(processed_path)
+            result = self._llama_client.predict(processed_path, task_type=task_type)
             md = result["markdown"]
             return {"markdown": md, "text": self._extract_text_from_vlm(md), "raw": result.get("raw")}
         else:
@@ -719,20 +738,23 @@ class ModelRouter:
             md = self._extract_markdown(result)
             return {"markdown": md, "text": self._extract_text_from_vlm(md), "raw": result}
 
-    def predict_vlm_batch(self, image_paths: list) -> list:
+    def predict_vlm_batch(self, image_paths: list, task_type: str = "text") -> list:
         """
         批量 VLM 预测。
 
         Args:
             image_paths: 图片路径列表
+            task_type: 任务类型（按路由决定）
 
         Returns:
             list[dict]: 每个元素格式与 predict_vlm() 一致
         """
         if self.vlm_backend == "fastdeploy":
-            return self._fastdeploy_client.predict_batch(image_paths)
+            return self._fastdeploy_client.predict_batch(image_paths, task_type=task_type)
         elif self.vlm_backend == "llamacpp":
-            return self._llama_client.predict_batch(image_paths)
+            return self._llama_client.predict_batch(
+                image_paths, task_type=task_type, concurrency=settings.MAX_CONCURRENT,
+            )
         else:
             if self._vl_pipeline is None:
                 raise RuntimeError("PaddleOCR-VL 未加载")
@@ -814,29 +836,43 @@ class ModelRouter:
         使用表格专用引擎识别页面。
 
         回退策略:
-          1. 方向校正 → 表格引擎
-          2. 表格引擎空结果 → 整图 4x 放大 → VLM
+          1. 方向校正 → 表格引擎（如有 bbox 则裁剪+3x 放大表格区域）
+          2. 表格引擎空结果 → 整图 4x 放大 → VLM（带 Table Recognition: 前缀）
         """
         if self._table_engine is None:
             logger.warning("表格引擎不可用，回退到 VLM")
-            return self.predict_vlm(image_path)
-        # 先校正方向，再送表格引擎
+            return self.predict_vlm(image_path, task_type="table")
+        # 先校正方向
         processed_path = self._preprocess_image(image_path)
-        result = self._table_engine.predict(processed_path)
+
+        # 如果有表格边界框，裁剪+放大表格区域送给表格引擎
+        if table_bbox:
+            zoomed_path = self._zoom_table_region(processed_path, bbox=table_bbox, scale=3)
+            result = self._table_engine.predict(zoomed_path)
+            md = (result.get("markdown") or "").strip()
+            txt = (result.get("text") or "").strip()
+            if md or txt:
+                logger.info(f"表格区域裁剪放大（3x）识别成功")
+                return result
+            logger.info("表格区域识别为空，回退到整页表格引擎")
+            result = self._table_engine.predict(processed_path)
+        else:
+            result = self._table_engine.predict(processed_path)
+
         md = (result.get("markdown") or "").strip()
         txt = (result.get("text") or "").strip()
         if not md and not txt:
-            logger.info("表格引擎输出为空，4x 放大校正后图片再走 VLM")
-            # 在已校正的图片上整图放大（不依赖 bbox，避免旋转后坐标失效）
+            logger.info("表格引擎输出为空，4x 放大校正后图片再走 VLM（表识前缀）")
+            # 在已校正的图片上整图放大
             upscaled = self._upscale_image(processed_path, scale=4)
-            return self.predict_vlm(upscaled)
+            return self.predict_vlm(upscaled, task_type="table")
         return result
 
     def predict_table_batch(self, image_paths: list, table_bboxes: dict = None) -> list:
-        """批量表格识别 — 空结果 4x 放大回退到 VLM"""
+        """批量表格识别 — 空结果 4x 放大回退到 VLM（带 Table Recognition: 前缀）"""
         if self._table_engine is None:
             logger.warning("表格引擎不可用，逐页回退到 VLM")
-            return [self.predict_vlm(p) for p in image_paths]
+            return [self.predict_vlm(p, task_type="table") for p in image_paths]
         processed = [self._preprocess_image(p) for p in image_paths]
         results = self._table_engine.predict_batch(processed)
         for i in range(len(results)):
@@ -845,9 +881,9 @@ class ModelRouter:
             md = (results[i].get("markdown") or "").strip()
             txt = (results[i].get("text") or "").strip()
             if not md and not txt:
-                logger.info(f"表格批量第{i}页输出为空，4x 放大后走 VLM")
+                logger.info(f"表格批量第{i}页输出为空，4x 放大后走 VLM（表识前缀）")
                 upscaled = self._upscale_image(processed[i], scale=4)
-                results[i] = self.predict_vlm(upscaled)
+                results[i] = self.predict_vlm(upscaled, task_type="table")
         return results
 
     def process_with_route(self, image_path: str, routing_enabled: bool = True) -> dict:
@@ -860,7 +896,7 @@ class ModelRouter:
         t_start = time.time()
 
         if not routing_enabled:
-            result = self.predict_vlm(image_path)
+            result = self.predict_vlm(image_path, task_type="text")
             result["route"] = "vlm"
             result["route_reason"] = "路由关闭"
             result["timing_ms"] = int((time.time() - t_start) * 1000)
@@ -881,11 +917,21 @@ class ModelRouter:
                 table_bbox = block["coordinate"]
                 break
 
-        # 3. 按路由处理
+        # 3. 按路由处理（根据检测到的复杂区域类型匹配官方任务前缀）
         if route == "table":
             result = self.predict_table(image_path, table_bbox=table_bbox)
         elif route == "vlm":
-            result = self.predict_vlm(image_path)
+            # 根据检测到的元素类型选择前缀
+            detected = classification.get("detected_complex", [])
+            if any(t in detected for t in ("formula", "display_formula", "inline_formula")):
+                vlm_task = "formula"
+            elif "chart" in detected:
+                vlm_task = "chart"
+            elif "seal" in detected:
+                vlm_task = "seal"
+            else:
+                vlm_task = "text"  # OCR: 通用文字提取
+            result = self.predict_vlm(image_path, task_type=vlm_task)
         else:
             result = self.predict_light_ocr(image_path)
         t_done = time.time()
@@ -905,9 +951,21 @@ class ModelRouter:
             "classification_ms": int((t_classified - t_start) * 1000),
             "inference_ms": int((t_done - t_classified) * 1000),
         }
-        # 幻觉检测
+        # 幻觉检测 + 自动重试
         warnings = self._detect_hallucinations(result.get("markdown", ""))
-        if warnings:
+        if warnings and route in ("vlm", "table"):
+            logger.warning(f"检测到幻觉 ({warnings[0][:60]}...)，使用默认前缀重试")
+            result = self.predict_vlm(image_path, task_type="text")
+            t_retry = time.time()
+            retry_warnings = self._detect_hallucinations(result.get("markdown", ""))
+            if retry_warnings:
+                result["hallucination_warnings"] = warnings + retry_warnings
+                logger.warning(f"重试后仍有幻觉 ({len(retry_warnings)} 项)")
+            else:
+                logger.info("重试后幻觉已消除")
+            result["timing_ms"] = int((t_retry - t_start) * 1000)
+            result["timing_breakdown"]["retry_ms"] = int((t_retry - t_done) * 1000)
+        elif warnings:
             result["hallucination_warnings"] = warnings
         return result
 

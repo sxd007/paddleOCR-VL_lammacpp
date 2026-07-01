@@ -77,10 +77,21 @@ class LlamaCppClient:
     # 核心推理
     # ==================================================================
 
+    # 官方任务前缀（PaddleOCR-VL-1.6-GGUF 专用）
+    # 模型使用极短前缀触发特定元素识别能力
+    PROMPTS = {
+        "text": "OCR:",
+        "table": "Table Recognition:",
+        "formula": "Formula Recognition:",
+        "chart": "Chart Recognition:",
+        "seal": "Seal Recognition:",
+    }
+
     def predict(
         self,
         image_path: str,
         prompt: Optional[str] = None,
+        task_type: str = "text",
         max_tokens: int = 4096,
         timeout: int = 120,
     ) -> dict:
@@ -89,7 +100,8 @@ class LlamaCppClient:
 
         Args:
             image_path: 图片本地路径
-            prompt: OCR 提示词（有默认值）
+            prompt: 自定义提示词（覆盖 task_type）
+            task_type: 任务类型 -> text/table/formula/chart/seal
             max_tokens: 最大生成长度
             timeout: 请求超时秒数
 
@@ -99,10 +111,7 @@ class LlamaCppClient:
         import requests
 
         if prompt is None:
-            prompt = (
-                "请完整提取图片中的所有文字内容，保持原始段落结构和排版层次。"
-                "输出格式：纯markdown，标题用#，表格用html，段落间空行分隔。"
-            )
+            prompt = self.PROMPTS.get(task_type, "OCR:")
 
         # 读取并编码图片
         with open(image_path, "rb") as f:
@@ -129,43 +138,55 @@ class LlamaCppClient:
             "temperature": 0,
         }
 
-        try:
-            t0 = time.time()
-            resp = requests.post(
-                self.chat_url,
-                json=payload,
-                timeout=timeout,
-            )
-            resp.raise_for_status()
-            elapsed = time.time() - t0
-            data = resp.json()
-            content = data["choices"][0]["message"]["content"]
+        max_retries = 2
+        last_error = None
+        for attempt in range(max_retries + 1):
+            try:
+                t0 = time.time()
+                resp = requests.post(
+                    self.chat_url,
+                    json=payload,
+                    timeout=timeout,
+                )
+                resp.raise_for_status()
+                elapsed = time.time() - t0
+                data = resp.json()
+                content = data["choices"][0]["message"]["content"]
 
-            # 兼容 str / dict 两种返回格式
-            if isinstance(content, str):
-                md = content.strip()
-            elif isinstance(content, dict):
-                md = content.get("text", content.get("content", str(content)))
-            else:
-                md = str(content)
+                # 兼容 str / dict 两种返回格式
+                if isinstance(content, str):
+                    md = content.strip()
+                elif isinstance(content, dict):
+                    md = content.get("text", content.get("content", str(content)))
+                else:
+                    md = str(content)
 
-            logger.debug(f"llama.cpp 推理完成: {len(md)}字符, 耗时{elapsed:.1f}s")
-            return {"markdown": md, "raw": data}
+                logger.debug(f"llama.cpp 推理完成: {len(md)}字符, 耗时{elapsed:.1f}s")
+                return {"markdown": md, "raw": data}
 
-        except requests.exceptions.Timeout:
-            logger.error(f"llama.cpp 请求超时 ({timeout}s)")
-            raise
-        except requests.exceptions.ConnectionError as e:
-            logger.error(f"llama.cpp 连接失败: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"llama.cpp API 调用失败: {e}")
-            raise
+            except requests.exceptions.Timeout:
+                last_error = f"llama.cpp 请求超时 ({timeout}s)"
+                logger.warning(f"{last_error} (第{attempt + 1}次)")
+            except requests.exceptions.ConnectionError as e:
+                last_error = f"llama.cpp 连接失败: {e}"
+                logger.warning(f"{last_error} (第{attempt + 1}次)")
+            except Exception as e:
+                last_error = f"llama.cpp API 调用失败: {e}"
+                logger.warning(f"{last_error} (第{attempt + 1}次)")
+
+            if attempt < max_retries:
+                sleep_time = 2 ** attempt  # 指数退避：1s, 2s
+                logger.info(f"等待 {sleep_time}s 后重试...")
+                time.sleep(sleep_time)
+
+        logger.error(f"llama.cpp 全部重试失败: {last_error}")
+        raise RuntimeError(last_error)
 
     def predict_batch(
         self,
         image_paths: list,
         prompt: Optional[str] = None,
+        task_type: str = "text",
         max_tokens: int = 4096,
         concurrency: int = 4,
     ) -> list:
@@ -175,6 +196,7 @@ class LlamaCppClient:
         Args:
             image_paths: 图片路径列表
             prompt: OCR 提示词
+            task_type: 任务类型（按路由决定）
             max_tokens: 最大生成长度
             concurrency: 并发数
 
@@ -190,7 +212,7 @@ class LlamaCppClient:
 
         def _predict_single(idx: int, path: str) -> tuple:
             try:
-                result = self.predict(path, prompt=prompt, max_tokens=max_tokens)
+                result = self.predict(path, prompt=prompt, task_type=task_type, max_tokens=max_tokens)
                 return idx, result, None
             except Exception as e:
                 logger.error(f"llama.cpp 批量第{idx}项失败 ({path}): {e}")

@@ -46,6 +46,10 @@ class Settings:
         self.ROUTING_COMPLEX_THRESHOLD: float = float(os.getenv("ROUTING_COMPLEX_THRESHOLD", "0.3"))
         self.LAYOUT_CONFIDENCE_THRESHOLD: float = float(os.getenv("LAYOUT_CONFIDENCE_THRESHOLD", "0.3"))
 
+        # PDF 渲染 DPI 配置
+        self.PDF_DPI_DEFAULT: int = int(os.getenv("PDF_DPI_DEFAULT", "200"))
+        self.PDF_DPI_TABLE: int = int(os.getenv("PDF_DPI_TABLE", "300"))
+
         # VLM 后端选择
         self.VLM_BACKEND: str = os.getenv("VLM_BACKEND", "native").lower()
         # FastDeploy 后端（原默认）

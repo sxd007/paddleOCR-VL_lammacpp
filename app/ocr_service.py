@@ -187,7 +187,7 @@ class OCREngine:
             t_chunk_start = time.time()
             for page_num in range(page_start, page_end):
                 page = pdf[page_num]
-                bitmap = page.render(scale=200 / 72)
+                bitmap = page.render(scale=settings.PDF_DPI_DEFAULT / 72)
                 pil_image = bitmap.to_pil()
                 img_path = temp_dir / f"chunk_{chunk_idx}_p{page_num}.png"
                 pil_image.save(str(img_path))
@@ -297,7 +297,6 @@ class OCREngine:
                                 total_errors += 1
 
                 # === 阶段 2e：表格批量推理 ===
-                total_table = 0
                 if table_entries:
                     logger.info(f"  表格识别处理 {len(table_entries)} 页...")
                     t0 = time.time()
