@@ -185,13 +185,17 @@ class OCREngine:
             # === 阶段 1：渲染本批所有页面到临时文件 ===
             chunk_entries = []  # [(页码, 图片路径), ...]
             t_chunk_start = time.time()
+            rotation_angles = {}
             for page_num in range(page_start, page_end):
                 page = pdf[page_num]
                 bitmap = page.render(scale=settings.PDF_DPI_DEFAULT / 72)
                 pil_image = bitmap.to_pil()
                 img_path = temp_dir / f"chunk_{chunk_idx}_p{page_num}.png"
                 pil_image.save(str(img_path))
-                chunk_entries.append((page_num + 1, str(img_path)))
+                # orientation correction BEFORE layout classification
+                processed_path, angle = router._preprocess_image(str(img_path))
+                rotation_angles[page_num + 1] = angle
+                chunk_entries.append((page_num + 1, processed_path))
             t_render = time.time()
 
             # 用于传递版面分类信息到逐页结果（路由关闭时留空）
@@ -317,7 +321,14 @@ class OCREngine:
                         pil_image = bitmap.to_pil()
                         img_path = temp_dir / f"chunk_{chunk_idx}_p{page_num}_hdpi.png"
                         pil_image.save(str(img_path))
-                        table_image_paths.append((page_num, str(img_path)))
+                        # reuse angle from low-DPI orientation — don't re-run model
+                        angle = rotation_angles.get(page_num, 0)
+                        if angle != 0:
+                            angle_map = {90: -90, 180: -180, 270: -270}
+                            rotated_hdpi = router._rotate_image(str(img_path), angle_map.get(angle, 0))
+                            table_image_paths.append((page_num, rotated_hdpi))
+                        else:
+                            table_image_paths.append((page_num, str(img_path)))
                         # bbox 坐标从低 DPI 空间缩放到高 DPI 空间
                         cls = cls_by_page.get(page_num, {})
                         for block in cls.get("layout_blocks", []):

@@ -730,7 +730,7 @@ class ModelRouter:
             logger.warning(f"PP-DocOrientationClassifier 加载失败（不影响主流程）: {e}")
             self._orientation_model = None
 
-    def _preprocess_image(self, image_path: str) -> str:
+    def _preprocess_image(self, image_path: str):
         """
         通用图像预处理：方向校正。
 
@@ -742,42 +742,57 @@ class ModelRouter:
             image_path: 输入图片路径
 
         Returns:
-            处理后的图片路径（可能和输入相同，表示无需校正）
+            (处理后的图片路径, 旋转角度)。旋转角度为 0/90/180/270。
+            角度为 0 时返回原路径；非 0 时返回新生成的校正后文件路径。
         """
         if self._orientation_model is None:
-            return image_path
+            return image_path, 0
 
         try:
             # 推理方向
             raw = list(self._orientation_model.predict(image_path))
             if not raw:
-                return image_path
+                return image_path, 0
 
             result = raw[0] if isinstance(raw, list) else raw
             class_id = result.get("class_id", 0) if isinstance(result, dict) else 0
 
             # class_id: 0=0°, 1=90°CW, 2=180°, 3=270°CW
             if class_id == 0:
-                return image_path
+                return image_path, 0
 
             angle_map = {1: -90, 2: -180, 3: -270}
             angle = angle_map.get(class_id, 0)
             logger.info(f"检测到图像旋转 {abs(angle)}°，自动校正")
 
-            from PIL import Image
-            img = Image.open(image_path)
-            rotated = img.rotate(angle, expand=True)
-
-            # 写回同目录，避免跨设备/容器路径问题
-            base, ext = os.path.splitext(image_path)
-            rotated_path = f"{base}_rot{abs(angle)}c{ext}"
-            rotated.save(rotated_path)
-            logger.info(f"方向校正后图片: {rotated_path}")
-            return rotated_path
+            rotated_path = self._rotate_image(image_path, angle)
+            return rotated_path, abs(angle)
 
         except Exception as e:
             logger.warning(f"方向校正失败，使用原图: {e}")
-            return image_path
+            return image_path, 0
+
+    def _rotate_image(self, image_path: str, angle: int) -> str:
+        """
+        PIL-only rotation without re-running the orientation model.
+
+        Args:
+            image_path: input image path
+            angle: rotation angle (-90/-180/-270)
+
+        Returns:
+            path to rotated image
+        """
+        from PIL import Image
+        img = Image.open(image_path)
+        rotated = img.rotate(angle, expand=True)
+
+        base, ext = os.path.splitext(image_path)
+        abs_angle = abs(angle)
+        rotated_path = f"{base}_rot{abs_angle}c{ext}"
+        rotated.save(rotated_path)
+        logger.info(f"apply rotation {abs_angle}: {rotated_path}")
+        return rotated_path
 
     def warmup_vlm(self):
         """预热 VLM 推理"""
@@ -831,9 +846,11 @@ class ModelRouter:
             return "light_ocr", "纯文字页面"
 
     def predict_vlm(self, image_path: str, task_type: str = "text") -> dict:
-        """使用配置的 VLM 后端处理页面。返回带 page-level 元素的完整结果。"""
-        # 图像预处理：方向校正（如果启用）
-        processed_path = self._preprocess_image(image_path)
+        """使用配置的 VLM 后端处理页面。返回带 page-level 元素的完整结果。
+
+        Note: caller must pass an image_path already processed by _preprocess_image().
+        """
+        processed_path = image_path
 
         if self.vlm_backend == "fastdeploy":
             result = self._fastdeploy_client.predict(processed_path, task_type=task_type)
@@ -989,8 +1006,8 @@ class ModelRouter:
                     "content": {"html": vlm_result.get("text", "")},
                 }]
             return vlm_result
-        # 先校正方向
-        processed_path = self._preprocess_image(image_path)
+        # image_path already preprocessed by caller; keep as processed_path
+        processed_path = image_path
 
         # 如果有表格边界框，裁剪+放大表格区域送给表格引擎
         if table_bbox:
@@ -1040,7 +1057,8 @@ class ModelRouter:
         if self._table_engine is None:
             logger.warning("表格引擎不可用，逐页回退到 VLM")
             return [self.predict_vlm(p, task_type="table") for p in image_paths]
-        processed = [self._preprocess_image(p) for p in image_paths]
+        # image_paths already preprocessed by caller
+        processed = list(image_paths)
 
         # 如果提供了 bbox，裁剪放大表格区域再送表格引擎
         if table_bboxes:
@@ -1086,8 +1104,11 @@ class ModelRouter:
         """
         t_start = time.time()
 
+        # Step 0: orientation correction FIRST, before classification
+        processed_path, _ = self._preprocess_image(image_path)
+
         if not routing_enabled:
-            result = self.predict_vlm(image_path, task_type="text")
+            result = self.predict_vlm(processed_path, task_type="text")
             result["route"] = "vlm"
             result["route_reason"] = "路由关闭"
             # VLM 路由诚实降级为 page-level 单元素
@@ -1104,8 +1125,8 @@ class ModelRouter:
             result["timing_ms"] = int((time.time() - t_start) * 1000)
             return result
 
-        # 1. 版面分类
-        classification = self.classifier.classify(image_path)
+        # 1. 版面分类（processed_path 已是校正后正图，bbox 坐标系一致）
+        classification = self.classifier.classify(processed_path)
         t_classified = time.time()
 
         # 2. 路由决策
@@ -1122,7 +1143,7 @@ class ModelRouter:
 
         # 3. 按路由处理（根据检测到的复杂区域类型匹配官方任务前缀）
         if route == "table":
-            result = self.predict_table(image_path, table_bbox=table_bbox)
+            result = self.predict_table(processed_path, table_bbox=table_bbox)
         elif route == "vlm":
             # 根据检测到的元素类型选择前缀
             if any(t in detected_complex for t in ("formula", "display_formula", "inline_formula")):
@@ -1133,7 +1154,7 @@ class ModelRouter:
                 vlm_task = "seal"
             else:
                 vlm_task = "text"  # OCR: 通用文字提取
-            result = self.predict_vlm(image_path, task_type=vlm_task)
+            result = self.predict_vlm(processed_path, task_type=vlm_task)
             # VLM 路由诚实降级为 page-level 单元素（覆盖 predict_vlm 的默认 page_text）
             result["elements"] = [{
                 "id": "e0",
@@ -1144,7 +1165,7 @@ class ModelRouter:
                 "content": {"text": result.get("text", "")},
             }]
         else:
-            result = self.predict_light_ocr(image_path)  # 已在引擎中自带 elements
+            result = self.predict_light_ocr(processed_path)  # 已在引擎中自带 elements
         t_done = time.time()
 
         result["route"] = route
@@ -1167,7 +1188,7 @@ class ModelRouter:
         warnings = self._detect_hallucinations(result.get("markdown", ""))
         if warnings and route in ("vlm", "table"):
             logger.warning(f"检测到幻觉 ({warnings[0][:60]}...)，使用默认前缀重试")
-            result = self.predict_vlm(image_path, task_type="text")
+            result = self.predict_vlm(processed_path, task_type="text")
             # 重试结果也加上 page-level 元素
             if "elements" not in result:
                 result["elements"] = [{
