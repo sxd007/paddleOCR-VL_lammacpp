@@ -869,12 +869,34 @@ class ModelRouter:
         return result
 
     def predict_table_batch(self, image_paths: list, table_bboxes: dict = None) -> list:
-        """批量表格识别 — 空结果 4x 放大回退到 VLM（带 Table Recognition: 前缀）"""
+        """
+        批量表格识别 — 带 bbox 裁剪放大 + 空结果 4x 放大回退到 VLM。
+
+        Args:
+            image_paths: 图片路径列表
+            table_bboxes: {idx: [x1, y1, x2, y2]} — 可选，用于裁剪放大表格区域
+
+        Returns:
+            list[dict]: 每个元素格式与 predict() 一致
+        """
         if self._table_engine is None:
             logger.warning("表格引擎不可用，逐页回退到 VLM")
             return [self.predict_vlm(p, task_type="table") for p in image_paths]
         processed = [self._preprocess_image(p) for p in image_paths]
-        results = self._table_engine.predict_batch(processed)
+
+        # 如果提供了 bbox，裁剪放大表格区域再送表格引擎
+        if table_bboxes:
+            zoomed_paths = []
+            for i, path in enumerate(processed):
+                bbox = table_bboxes.get(i)
+                if bbox:
+                    zoomed = self._zoom_table_region(path, bbox=bbox, scale=3)
+                    zoomed_paths.append(zoomed)
+                else:
+                    zoomed_paths.append(path)
+            results = self._table_engine.predict_batch(zoomed_paths)
+        else:
+            results = self._table_engine.predict_batch(processed)
         for i in range(len(results)):
             if results[i] is None:
                 results[i] = {"markdown": "", "text": ""}

@@ -300,20 +300,33 @@ class OCREngine:
                 if table_entries:
                     logger.info(f"  表格识别处理 {len(table_entries)} 页...")
                     t0 = time.time()
-                    table_paths = [p for _, p in table_entries]
-                    # 提取每页的表格边界框（用于裁剪放大回退）
+                    # 表格页用 PDF_DPI_TABLE 从矢量源重新渲染（比插值放大更清晰）
+                    scale_ratio = settings.PDF_DPI_TABLE / settings.PDF_DPI_DEFAULT
+                    table_image_paths = []
                     table_bboxes = {}
                     for idx, (page_num, _) in enumerate(table_entries):
+                        page = pdf[page_num - 1]
+                        bitmap = page.render(scale=settings.PDF_DPI_TABLE / 72)
+                        pil_image = bitmap.to_pil()
+                        img_path = temp_dir / f"chunk_{chunk_idx}_p{page_num}_hdpi.png"
+                        pil_image.save(str(img_path))
+                        table_image_paths.append((page_num, str(img_path)))
+                        # bbox 坐标从低 DPI 空间缩放到高 DPI 空间
                         cls = cls_by_page.get(page_num, {})
                         for block in cls.get("blocks", []):
                             if block.get("label") == "table" and block.get("coordinate"):
-                                table_bboxes[idx] = block["coordinate"]
+                                table_bboxes[idx] = [
+                                    int(v * scale_ratio) for v in block["coordinate"]
+                                ]
                                 break
                     try:
-                        table_results = router.predict_table_batch(table_paths, table_bboxes=table_bboxes)
+                        table_results = router.predict_table_batch(
+                            [p for _, p in table_image_paths],
+                            table_bboxes=table_bboxes,
+                        )
                         t_table_done = time.time()
-                        avg_ms = int((t_table_done - t0) / max(len(table_paths), 1) * 1000)
-                        for (page_num, _), result in zip(table_entries, table_results):
+                        avg_ms = int((t_table_done - t0) / max(len(table_image_paths), 1) * 1000)
+                        for (page_num, _), result in zip(table_image_paths, table_results):
                             all_results.append({
                                 "page": page_num, "markdown": result["markdown"],
                                 "text": result["text"], "route": "table", "raw": result.get("raw"),
@@ -324,16 +337,10 @@ class OCREngine:
                         logger.info(f"  表格批量完成 ({len(table_entries)} 页, {t_table_done - t0:.1f}s, 均 {avg_ms}ms/页)")
                     except Exception as e:
                         logger.warning(f"  表格批量失败，退化到逐页处理: {e}")
-                        for page_num, img_path in table_entries:
+                        for idx, (page_num, img_path) in enumerate(table_image_paths):
                             t_page = time.time()
                             try:
-                                # 从分类信息中取表格框坐标
-                                cls = cls_by_page.get(page_num, {})
-                                pg_bbox = None
-                                for blk in cls.get("blocks", []):
-                                    if blk.get("label") == "table" and blk.get("coordinate"):
-                                        pg_bbox = blk["coordinate"]
-                                        break
+                                pg_bbox = table_bboxes.get(idx)
                                 result = router.predict_table(img_path, table_bbox=pg_bbox)
                                 page_timing = int((time.time() - t_page) * 1000)
                                 all_results.append({

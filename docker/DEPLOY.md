@@ -115,66 +115,15 @@ curl http://localhost:8118/health
 
 ## 部署踩坑全记录
 
-共 12 个坑，按出现顺序排列：
+## ⚠️ 部署注意事项
 
-### 坑1: CUDA Toolkit 未安装
-**现象**: `CMake Error: CUDA Toolkit not found`  
-**解决**: 安装 CUDA 12.8  
-
-### 坑2: 80 并发编译导致系统卡死
-**现象**: `docker build` 到 47% 时 SSH 断连、80核满载、风扇狂转  
-**根因**: `-j$(nproc)` = 80 并行，CPU 410W + GPU 450W 触发 PSU 保护  
-**解决**: 限制并发 `-j8`
-
-### 坑3: Docker context 过大 (5.2GB)
-**现象**: 构建时 I/O 100%，系统无响应  
-**根因**: 无 `.dockerignore`，整个 `llama.cpp-src/` 被打包  
-**解决**: 添加 `.dockerignore` + 预编译二进制模式
-
-### 坑4: 缺失共享库 libllama.so
-**现象**: `error while loading shared libraries: libllama.so`  
-**解决**: COPY 二进制时同时 COPY 所有 `.so` 文件
-
-### 坑5: CUDA 库路径未配置
-**现象**: `libcudart.so.12: cannot open shared object file`  
-**解决**: 设置 `LD_LIBRARY_PATH` 包含 `/usr/local/cuda/targets/x86_64-linux/lib`
-
-### 坑6: PaddlePaddle 3.x 包名变更
-**现象**: `ERROR: Could not find a version paddlepaddle-gpu==3.2.1`  
-**根因**: PaddlePaddle 3.x 统一包名为 `paddlepaddle`（不再分 cpu/gpu）  
-**解决**: `paddlepaddle-gpu` -> `paddlepaddle`
-
-### 坑7: 内部 H3C PyPI 镜像不可达
-**现象**: pip 从 `172.22.1.36` 安装失败  
-**解决**: 换用公开镜像 `https://pypi.mirrors.ustc.edu.cn/simple/`
-
-### 坑8: docker-compose v1 GPU 配置不生效
-**现象**: `libcuda.so.1: cannot open shared object file`  
-**根因**: `deploy.resources` 在 docker-compose v1 中无效（仅 swarm 模式）  
-**解决**: 改用 `runtime: nvidia` + `NVIDIA_VISIBLE_DEVICES=0`
-
-### 坑9: Docker COPY 丢失 symlink
-**现象**: ldconfig 报 `is not a symbolic link`  
-**根因**: 新版 llama.cpp 使用版本化 .so (如 `libggml.so.0 -> libggml.so.0.15.1`)  
-**解决**: `cp -a` 保留 symlink，Dockerfile 中 COPY 所有版本化文件
-
-### 坑10: llama.cpp 版本不支持 paddleocr 架构
-**现象**: `unknown model architecture: 'paddleocr'`  
-**根因**: 旧版未合入 PR [#18825](https://github.com/ggml-org/llama.cpp/pull/18825)  
-**解决**: 克隆最新版（不带 `--branch`），2026-02 后的版本均支持
-
-### 坑11: --mmproj 参数名变化
-**现象**: `error: invalid argument: --mmproj`  
-**解决**: 新版已支持 `--mmproj`（别名为 `-mm`）
-
-### 坑12: --flash-attn 参数格式变化
-**现象**: `error: unknown value for --flash-attn: '-b'`  
-**说明**: 不同版本参数格式不同，需查阅 `--help`
-
-| 版本 | 格式 |
-|------|------|
-| 旧版 (b5050) | `--flash-attn` (布尔) |
-| 新版 (f3e1828) | `--flash-attn on` (取值 on/off/auto) |
+| # | 关键点 | 正确做法 |
+|---|--------|---------|
+| 1 | **PaddlePaddle GPU wheel 不在 PyPI 上** | `pip install paddlepaddle-gpu==3.2.1 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/`。PyPI 上的 `paddlepaddle`（~180 MB）和 `paddlepaddle-gpu`（最高 2.6.2）都是 CPU-only |
+| 2 | **docker-compose v1 GPU 配置** | `runtime: nvidia` + `NVIDIA_VISIBLE_DEVICES=0`，`deploy.resources` 在 v1 中无效 |
+| 3 | **Docker COPY 丢失 symlink** | `cp -a` 保留 symlink，COPY 所有版本化 .so 文件 |
+| 4 | **llama.cpp 版本要求** | 克隆最新版（不带 `--branch`），需含 PR [#18825](https://github.com/ggml-org/llama.cpp/pull/18825) 的 paddleocr 架构支持 |
+| 5 | **构建上下文过大** | 添加 `.dockerignore` 排除 `llama.cpp-src/`，改用预编译二进制模式 |
 
 ---
 

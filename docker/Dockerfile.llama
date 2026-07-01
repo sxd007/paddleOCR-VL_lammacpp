@@ -69,12 +69,9 @@ HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=120s \
 #   --parallel 4      — 与应用层 MAX_CONCURRENT/并发数对齐。llama.cpp 会把 -c 平分给各 slot。
 #   --ubatch-size 1024— 更大的内部批大小提升 GPU 利用率。
 #
-# ⚠️ 视觉编码器像素上限（clip.vision.image_max_pixels）
-#   GGUF mmproj 默认约 100 万像素。A4@200DPI 约 387 万像素会被静默压缩。
-#   如需更高密度识别（小字/表格），建议提前用工具调大：
-#     python ./gguf-py/gguf/scripts/gguf_set_metadata.py \
-#       /models/PaddleOCR-VL-1.6-GGUF-mmproj.gguf \
-#       clip.vision.image_max_pixels 1605632 --force
+# ✅ 视觉编码器像素上限（clip.vision.image_max_pixels）
+#   已从默认 ~1MP 提升至 ~1.6MP (1605632)，减少 A4@200DPI(3.87MP) 静默压缩。
+#   如需进一步调高，用 gguf_set_metadata 修改 mmproj 文件即可。
 # ============================================================================
 ENTRYPOINT ["llama-server"]
 CMD ["-m", "/models/PaddleOCR-VL-1.6-GGUF.gguf", \

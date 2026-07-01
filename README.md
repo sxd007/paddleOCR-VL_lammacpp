@@ -3,7 +3,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![PaddlePaddle](https://img.shields.io/badge/PaddlePaddle-3.2.1-brightgreen)](https://github.com/PaddlePaddle/Paddle)
 [![PaddleOCR](https://img.shields.io/badge/PaddleOCR-3.6.0-orange)](https://github.com/PaddlePaddle/PaddleOCR)
-[![CUDA](https://img.shields.io/badge/CUDA-11.8%2B-green)](https://developer.nvidia.com/cuda-toolkit)
+[![CUDA](https://img.shields.io/badge/CUDA-12.6%2B-green)](https://developer.nvidia.com/cuda-toolkit)
 [![License](https://img.shields.io/badge/license-Apache%202.0-yellow)](LICENSE)
 
 基于 PaddleOCR-VL 1.6 + PP-DocLayoutV3 的企业级文档解析 REST API，支持 **模型路由架构**：先版面分类、再动态调度模型，在大文档上实现 3-10 倍提速。
@@ -141,12 +141,15 @@ Uvicorn running on http://0.0.0.0:8086
 python3.10 -m venv .venv
 source .venv/bin/activate
 
-# 2. 安装 PaddlePaddle
+# 2. 安装 PaddlePaddle（GPU 版）
+# ⚠️ PaddlePaddle 3.x GPU wheel 不在 PyPI 上，必须从官方索引站安装：
+#    -i https://www.paddlepaddle.org.cn/packages/stable/cuXXX/
+# PyPI 上的 paddlepaddle / paddlepaddle-gpu 都是 CPU-only。
 # CUDA 12.6:
-pip install paddlepaddle==3.2.1 -f https://www.paddlepaddle.org.cn/whl/linux/cu126/stable.html
+pip install paddlepaddle-gpu==3.2.1 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
 # CUDA 11.8:
-# pip install paddlepaddle==3.2.1 -f https://www.paddlepaddle.org.cn/whl/linux/cu118/stable.html
-# CPU only:
+# pip install paddlepaddle-gpu==3.2.1 -i https://www.paddlepaddle.org.cn/packages/stable/cu118/
+# CPU only（从 PyPI 装）:
 # pip install paddlepaddle==3.2.1
 
 # 3. 安装其他依赖
@@ -230,26 +233,16 @@ docker compose up -d llama-ocr
 
 ---
 
-## 部署踩坑全记录（12 个坑）
+## ⚠️ 部署注意事项
 
-本项目的 Docker 部署经历多次迭代，以下列出真实遇到的全部问题及解决方案：
+几个最容易卡住的点，记住这些就够了：
 
-| # | 坑 | 现象 | 根因 | 解决 |
-|---|-----|------|------|------|
-| 1 | **CUDA Toolkit 未安装** | `CMake Error: CUDA Toolkit not found` | 宿主机缺少 CUDA | 安装 CUDA 12.8 |
-| 2 | **80 并发编译卡死** | `docker build` 到 47% 时 SSH 断连、CPU 满载 | `-j$(nproc)` = 80 并行，CPU 410W + GPU 450W 触发 PSU 保护 | 限制并发 `-j8` |
-| 3 | **Docker context 过大 (5.2GB)** | 构建时 I/O 100%，系统无响应 | 无 `.dockerignore`，`llama.cpp-src/` 全量打包 | 添加 `.dockerignore` + 预编译二进制模式 |
-| 4 | **缺失共享库 libllama.so** | `error: cannot open shared object file` | 镜像内缺少运行时 .so | COPY 二进制时同时 COPY 所有 `.so` |
-| 5 | **CUDA 库路径未配置** | `libcudart.so.12: cannot open` | `LD_LIBRARY_PATH` 未包含 CUDA 库 | 设置 `LD_LIBRARY_PATH` 指向 CUDA lib 目录 |
-| 6 | **PaddlePaddle 3.x 包名变更** | `Could not find paddlepaddle-gpu==3.2.1` | 3.x 统一包名为 `paddlepaddle` | 使用 `paddlepaddle` 替代 `paddlepaddle-gpu` |
-| 7 | **内部 PyPI 镜像不可达** | pip 从 `172.22.1.36` 安装失败 | 企业内网镜像不可用 | 换用中科大 USTC 公开镜像 |
-| 8 | **docker-compose v1 GPU 不生效** | `libcuda.so.1: not found` | `deploy.resources` 仅 swarm 模式有效 | 改用 `runtime: nvidia` + 环境变量 |
-| 9 | **Docker COPY 丢失 symlink** | ldconfig 报 symlink 错误 | `COPY` 不保留软链接（版本化 .so） | `cp -a` 保留，Dockerfile COPY 所有版本 |
-| 10 | **llama.cpp 不支持 paddleocr 架构** | `unknown model architecture: 'paddleocr'` | 旧版未合入 PR [#18825](https://github.com/ggml-org/llama.cpp/pull/18825) | 克隆最新版（不带 `--branch`） |
-| 11 | **`--mmproj` 参数名变化** | `error: invalid argument: --mmproj` | 新版 llama.cpp 参数名变更 | 新版已支持（别名 `-mm`） |
-| 12 | **`--flash-attn` 参数格式变化** | `error: unknown value for --flash-attn` | 不同版本参数格式不同 | 旧版布尔，新版 `--flash-attn on` |
-
-> 完整踩坑文档见 [`docker/DEPLOY.md`](docker/DEPLOY.md)
+| # | 关键点 | 正确做法 |
+|---|--------|---------|
+| 1 | **PaddlePaddle GPU wheel 不在 PyPI 上** | 必须从 `-i https://www.paddlepaddle.org.cn/packages/stable/cu126/` 装 `paddlepaddle-gpu==3.2.1`。PyPI 上的 `paddlepaddle` 装到的是 CPU 版 |
+| 2 | **docker-compose v1 GPU 配置** | 用 `runtime: nvidia` + `NVIDIA_VISIBLE_DEVICES=0`，`deploy.resources` 在 v1 中无效 |
+| 3 | **Docker COPY 丢失 symlink** | 复制 .so 文件用 `cp -a` 保留 symlink 链，Dockerfile 中 COPY 所有版本化文件 |
+| 4 | **llama.cpp 版本要求** | 必须用最新版（含 PR [#18825](https://github.com/ggml-org/llama.cpp/pull/18825)），`--branch` 会拉到旧版 |
 
 ---
 
