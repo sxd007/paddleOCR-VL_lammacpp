@@ -443,7 +443,7 @@ class OCREngine:
                 logger.info(
                     f"  批次 {chunk_idx + 1} 耗时明细: "
                     f"渲染={t_render - t_chunk_start:.1f}s | "
-                    f"分类={t_classify - t_render:.1f}s | "
+                    f"分类={locals().get('t_classify', t_chunk_start) - t_render:.1f}s | "
                     f"轻量OCR={light_time:.1f}s({len(light_entries)}页) | "
                     f"表格={table_time:.1f}s({len(table_entries)}页) | "
                     f"VLM={vlm_time:.1f}s({len(vlm_entries)}页) | "
