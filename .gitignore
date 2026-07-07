@@ -87,3 +87,7 @@ docs/plan/
 # OS files
 Thumbs.db
 test_examples/
+
+# Test / diagnostic files (root level)
+/diagnosis_final.md
+/table_test.jpg
