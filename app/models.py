@@ -31,6 +31,16 @@ class OCRRequest(BaseModel):
         None,
         description="是否启用文档矫正（覆盖全局配置）",
     )
+    mode: Optional[str] = Field(
+        None,
+        description=(
+            "路由模式。可选值:\n"
+            '  "routing" (默认) — 版面分类后路由到专业引擎（表格→PPStructure，文字→PP-OCR，复杂→VLM）\n'
+            '  "vlm" — 全部使用 PaddleOCR-VL（跳过分类和路由，适合复杂混合内容）\n'
+            '  "table_pp" — 路由模式下强制走 PPStructure 表格管线（即使版面分类未检出表格）'
+        ),
+        example="routing",
+    )
     include: Optional[List[str]] = Field(
         None,
         description=(

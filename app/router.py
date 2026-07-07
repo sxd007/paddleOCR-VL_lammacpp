@@ -1271,7 +1271,7 @@ class ModelRouter:
                 results[i] = self.predict_vlm(upscaled, task_type="table")
         return results
 
-    def process_with_route(self, image_path: str, routing_enabled: bool = True) -> dict:
+    def process_with_route(self, image_path: str, mode: str = "routing") -> dict:
         """
         完整处理流程：分类 → 路由 → 识别。
 
@@ -1284,10 +1284,10 @@ class ModelRouter:
         # Step 0: orientation correction FIRST, before classification
         processed_path, _ = self._preprocess_image(image_path)
 
-        if not routing_enabled:
+        if mode == "vlm":
             result = self.predict_vlm(processed_path, task_type="text")
             result["route"] = "vlm"
-            result["route_reason"] = "路由关闭"
+            result["route_reason"] = "客户端指定 VLM 模式"
             # VLM 路由诚实降级为 page-level 单元素
             if "elements" not in result:
                 result["elements"] = [{
@@ -1306,8 +1306,11 @@ class ModelRouter:
         classification = self.classifier.classify(processed_path)
         t_classified = time.time()
 
-        # 2. 路由决策
-        route, reason = self.decide_route(classification)
+        # 2. 路由决策（table_pp 模式强制走表格管线）
+        if mode == "table_pp":
+            route, reason = "table", "客户端指定 table_pp 模式"
+        else:
+            route, reason = self.decide_route(classification)
         logger.info(f"路由决策: {route} — {reason}")
         detected_complex = classification.get("detected_complex", [])
 
@@ -1365,8 +1368,13 @@ class ModelRouter:
         warnings = self._detect_hallucinations(result.get("markdown", ""))
         if warnings and route in ("vlm", "table"):
             logger.warning(f"检测到幻觉 ({warnings[0][:60]}...)，使用默认前缀重试")
+            _saved_tb = result.get("timing_breakdown", {})
+            _saved_route = route
+            _saved_reason = reason
             result = self.predict_vlm(processed_path, task_type="text")
-            # 重试结果也加上 page-level 元素
+            # 恢复路由标记 + 重试结果也加上 page-level 元素
+            result["route"] = _saved_route
+            result["route_reason"] = _saved_reason + " (幻觉重试)"
             if "elements" not in result:
                 result["elements"] = [{
                     "id": "e0",
@@ -1383,8 +1391,9 @@ class ModelRouter:
                 logger.warning(f"重试后仍有幻觉 ({len(retry_warnings)} 项)")
             else:
                 logger.info("重试后幻觉已消除")
+            _saved_tb["retry_ms"] = int((t_retry - t_done) * 1000)
+            result["timing_breakdown"] = _saved_tb
             result["timing_ms"] = int((t_retry - t_start) * 1000)
-            result["timing_breakdown"]["retry_ms"] = int((t_retry - t_done) * 1000)
         elif warnings:
             result["hallucination_warnings"] = warnings
         return result

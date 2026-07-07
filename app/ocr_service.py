@@ -100,9 +100,9 @@ class OCREngine:
             if task is None:  # 退出信号
                 break
 
-            task_id, input_path, page_size, result_callback, error_callback, include = task
+            task_id, input_path, page_size, result_callback, error_callback, include, mode = task
             try:
-                result = self._process_internal(router, input_path, page_size, include=include)
+                result = self._process_internal(router, input_path, page_size, include=include, mode=mode)
                 result_callback(result)
             except Exception as e:
                 error_callback(e)
@@ -110,7 +110,7 @@ class OCREngine:
                 self._task_queue.task_done()
 
     def _process_internal(self, router: ModelRouter, input_path: str, page_size: int,
-                          include: list = None) -> dict:
+                          include: list = None, mode: str = None) -> dict:
         """
         在工作者线程中执行实际的 OCR 处理。
         自动识别图片/PDF，并使用 ModelRouter 进行版面分类和路由。
@@ -119,13 +119,15 @@ class OCREngine:
         logger.info(f"处理: 类型={file_type}, 路径={str(file_path)[:80]}...")
 
         if file_type == "pdf":
-            return self._process_pdf(router, file_path, page_size, include=include)
+            return self._process_pdf(router, file_path, page_size, include=include, mode=mode)
         else:
-            return self._process_image(router, file_path, include=include)
+            return self._process_image(router, file_path, include=include, mode=mode)
 
-    def _process_image(self, router: ModelRouter, image_path: str, include: list = None) -> dict:
+    def _process_image(self, router: ModelRouter, image_path: str, include: list = None,
+                       mode: str = None) -> dict:
         """处理单张图片 — 通过路由引擎调度"""
-        result = router.process_with_route(image_path, routing_enabled=settings.ROUTING_ENABLED)
+        mode = mode or "routing"
+        result = router.process_with_route(image_path, mode=mode)
 
         route = result.get("route", "vlm")
         return {
@@ -145,7 +147,7 @@ class OCREngine:
         }
 
     def _process_pdf(self, router: ModelRouter, pdf_path: str, page_size: int = 20,
-                     include: list = None) -> dict:
+                     include: list = None, mode: str = None) -> dict:
         """
         处理 PDF 文件 — 两阶段批量优化版。
 
@@ -161,6 +163,8 @@ class OCREngine:
 
         if total_pages == 0:
             raise ValueError("PDF文件为空")
+
+        pdf_mode = mode or "routing"
 
         all_results = []
         total_light = 0
@@ -201,7 +205,16 @@ class OCREngine:
             # 用于传递版面分类信息到逐页结果（路由关闭时留空）
             cls_by_page = {}
 
-            if settings.ROUTING_ENABLED:
+            if pdf_mode == "vlm":
+                # mode="vlm"：全部走 VLM，跳过分类和路由
+                light_entries = []
+                table_entries = []
+                vlm_entries = chunk_entries[:]
+                for page_num, _ in chunk_entries:
+                    cls_by_page[page_num] = {
+                        "route": "vlm", "detected_complex": [], "layout_blocks": [],
+                    }
+            elif settings.ROUTING_ENABLED:
                 # === 阶段 2a：批量版面分类 ===
                 image_paths = [p for _, p in chunk_entries]
                 try:
@@ -551,7 +564,8 @@ class OCREngine:
     # ========== 公共接口 ==========
 
     def predict(self, image_input: str, page_size: Optional[int] = None,
-                timeout: int = 600, include: Optional[List[str]] = None) -> dict:
+                timeout: int = 600, include: Optional[List[str]] = None,
+                mode: str = None) -> dict:
         """
         提交 OCR 预测任务并等待结果。
 
@@ -560,6 +574,7 @@ class OCREngine:
             page_size: PDF分页大小（None使用默认值20，-1不拆分）
             timeout: 等待超时秒数
             include: 按需返回字段列表，不传则全部返回
+            mode: 路由模式（"routing"/"vlm"/"table_pp"），None 使用服务端默认
 
         Returns:
             dict: {markdown, text, file_type, total_pages, pages, raw}
@@ -577,7 +592,7 @@ class OCREngine:
         def on_error(e):
             error_container.append(e)
 
-        self._task_queue.put(("predict", image_input, ps, on_result, on_error, include))
+        self._task_queue.put(("predict", image_input, ps, on_result, on_error, include, mode))
 
         # 等待结果
         deadline = time.time() + timeout

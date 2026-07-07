@@ -153,7 +153,7 @@ def ocr_single(request: OCRRequest, req: Request):
         )
 
     try:
-        result = engine.predict(request.image, page_size=request.page_size, include=request.include)
+        result = engine.predict(request.image, page_size=request.page_size, include=request.include, mode=request.mode)
 
         page_items = None
         if result.get("pages"):
