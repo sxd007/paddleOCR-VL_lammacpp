@@ -415,9 +415,9 @@ class TableRecognitionEngine:
             else:
                 markdown = text_repr[:2000] if len(text_repr) > 2000 else text_repr
 
-        # 尝试物理网格线重建（有线表优先）
-        grid_markdown, grid_elements = self._rebuild_from_grid(
-            image_path, raw_results, table_bbox=table_bbox
+        # 尝试 cell_box_list 几何聚类重建（绕开 SLANet 结构模型列偏移）
+        grid_markdown, grid_elements = self._rebuild_from_cells(
+            raw_results, table_bbox=table_bbox
         )
         if grid_markdown:
             markdown = grid_markdown
@@ -455,218 +455,165 @@ class TableRecognitionEngine:
         text = _table_elements_to_text(elements)
         return {"markdown": markdown, "text": text, "elements": elements, "raw": raw_results}
 
-    def _rebuild_from_grid(self, image_path: str, raw_results: list,
-                           table_bbox: list = None, min_lines: int = 3):
+    def _rebuild_from_cells(self, raw_results: list, table_bbox: list = None):
         """
-        从物理网格线重建表格 HTML（有线表专用）。
+        从 cell_box_list 几何聚类重建表格 HTML。
 
-        从 PPStructureV3 的原始输出中提取预处理后的表格裁剪图，
-        用 OpenCV 形态学操作检测水平和垂直线，以网格线切分的矩形区域
-        作为单元格的权威几何范围，将 OCR 文本按 containment 匹配填入。
-
-        Returns:
-            (markdown, elements) 成功返回 (HTML字符串, 元素列表)，失败返回 (None, None)。
+        用 y 区间重叠做行聚类（绕开 y 中心偏移问题），按 x 排序确定列顺序，
+        用 rec_boxes containment 匹配文本。绕开 SLANet 结构模型的列偏移问题。
         """
-        import cv2
         import numpy as np
 
-        # 从 raw_results 提取 table 级 OCR 结果
         if not raw_results or not isinstance(raw_results, (list, tuple)):
             return None, None
         page = raw_results[0] if isinstance(raw_results[0], dict) else None
         if page is None:
             return None, None
-        table_res_list = page.get("table_res_list", [])
-        if not table_res_list:
+        tlist = page.get("table_res_list", [])
+        if not tlist:
             return None, None
-        table_res = table_res_list[0]
-        ocr_pred = table_res.get("table_ocr_pred", {})
-        rec_boxes = ocr_pred.get("rec_boxes", [])
-        rec_texts = ocr_pred.get("rec_texts", [])
-        rec_scores = ocr_pred.get("rec_scores", [])
-        if not rec_boxes or not rec_texts:
-            return None, None
+        tr = tlist[0]
 
-        # --- 获取图像用于网格线检测，坐标系要与 rec_boxes 一致 ---
-        # rec_boxes 坐标在 doc_preprocessor_res.output_img 的坐标空间里
-        # （如果 layout bbox [22,28,985,524] 可见，rec_boxes [27..978,23..522] 在此基础上）
-        # 策略1: 直接用预处理后的全页图（rec_boxes 天然同空间）
-        preproc = page.get("doc_preprocessor_res", {})
-        output_img = preproc.get("output_img") if isinstance(preproc, dict) else None
-        if output_img is not None and isinstance(output_img, np.ndarray):
-            grid_img = output_img
-        else:
-            # 策略2: 从 parsing_res_list 取 table LayoutBlock 的 image
-            for block in page.get("parsing_res_list", []):
-                label = getattr(block, "label", None) or ""
-                if "table" in str(label).lower():
-                    candidate = getattr(block, "image", None)
-                    if candidate is not None:
-                        grid_img = candidate
-                        break
-
-        # 策略3: 读磁盘
-        if grid_img is None:
-            grid_img = cv2.imread(image_path)
-        if grid_img is None:
-            grid_img = cv2.imread(image_path)
-
-        if grid_img is None:
+        cbl = tr.get("cell_box_list", [])
+        ocr = tr.get("table_ocr_pred", {})
+        rec_boxes = ocr.get("rec_boxes", [])
+        rec_texts = ocr.get("rec_texts", [])
+        rec_scores = ocr.get("rec_scores", [])
+        # cbl/rec_boxes 可能是 numpy array（Python bool 歧义报错）
+        n_cells = len(cbl) if hasattr(cbl, '__len__') else 0
+        n_boxes = len(rec_boxes) if hasattr(rec_boxes, '__len__') else 0
+        if n_cells == 0 or n_boxes == 0:
             return None, None
 
-        # 确保是 numpy 数组（可能是 PIL Image）
-        if not isinstance(grid_img, np.ndarray):
-            try:
-                grid_img = np.array(grid_img)
-            except Exception:
-                return None, None
+        # 行聚类：按 y 区间重叠（允许 gap 超过行间距）
+        cells = []
+        for i, box in enumerate(cbl):
+            x1, y1, x2, y2 = [float(v) for v in box]
+            cells.append((y1, y2, x1, x2, (x1+x2)/2, (y1+y2)/2, i))
+        cells.sort(key=lambda c: (c[0], c[4]))
 
-        # 确保 BGR 格式用于 OpenCV
-        if len(grid_img.shape) == 3 and grid_img.shape[2] == 4:
-            grid_img = cv2.cvtColor(grid_img, cv2.COLOR_RGBA2BGR)
-        elif len(grid_img.shape) == 3 and grid_img.shape[2] == 3:
-            pass  # already BGR or RGB
-        elif len(grid_img.shape) == 2:
-            grid_img = cv2.cvtColor(grid_img, cv2.COLOR_GRAY2BGR)
-
-        gray = cv2.cvtColor(grid_img, cv2.COLOR_BGR2GRAY)
-        h, w = gray.shape
-
-        # 如果 rec_boxes 坐标明显超出图像尺寸，缩放到图像空间
-        max_rec_x = max(b[2] for b in rec_boxes) if rec_boxes else 0
-        max_rec_y = max(b[3] for b in rec_boxes) if rec_boxes else 0
-        scale_x = w / max_rec_x if max_rec_x > w * 1.1 and max_rec_x > 0 else 1.0
-        scale_y = h / max_rec_y if max_rec_y > h * 1.1 and max_rec_y > 0 else 1.0
-        if scale_x != 1.0 or scale_y != 1.0:
-            logger.debug(f"grid: scaling rec_boxes by ({scale_x:.3f}, {scale_y:.3f})")
-            rec_boxes = [[
-                int(b[0] * scale_x), int(b[1] * scale_y),
-                int(b[2] * scale_x), int(b[3] * scale_y),
-            ] for b in rec_boxes]
-
-        # 二值化 + 形态学提取网格线
-        thresh = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV, 31, 5
-        )
-
-        h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(w // 2, 1), 1))
-        h_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, h_kernel)
-        h_contours, _ = cv2.findContours(h_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        h_pos = sorted(set(
-            cv2.boundingRect(ct)[1]
-            for ct in h_contours
-            if cv2.boundingRect(ct)[2] > w * 0.15
-        ))
-
-        v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(h // 2, 1)))
-        v_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, v_kernel)
-        v_contours, _ = cv2.findContours(v_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        v_pos = sorted(set(
-            cv2.boundingRect(ct)[0]
-            for ct in v_contours
-            if cv2.boundingRect(ct)[3] > h * 0.15
-        ))
-
-        if len(h_pos) < min_lines or len(v_pos) < min_lines:
+        # 用 y1 间隙聚类行（累积 overlap 会因行间 y 区间交叠而合并所有行为一行）
+        GAP_THRESHOLD = 15  # px
+        rows = []
+        cur = [cells[0]]
+        for c in cells[1:]:
+            if c[0] - cur[-1][0] < GAP_THRESHOLD:
+                cur.append(c)
+            else:
+                rows.append(sorted(cur, key=lambda c: c[4]))
+                cur = [c]
+        rows.append(sorted(cur, key=lambda c: c[4]))
+        rows = [r for r in rows if len(r) >= 2]
+        if len(rows) < 2:
             return None, None
 
-        merged_h, merged_v = [h_pos[0]], [v_pos[0]]
-        for p in h_pos[1:]:
-            if p - merged_h[-1] >= 5:
-                merged_h.append(p)
-        for p in v_pos[1:]:
-            if p - merged_v[-1] >= 5:
-                merged_v.append(p)
-        h_pos, v_pos = merged_h, merged_v
+        # 从 cell_box_list 中所有 cell 的 x1/x2 边缘聚类得到列边界（不受 colspan 影响）
+        all_x = []
+        for c in cells:
+            all_x.append(c[2])  # x1
+            all_x.append(c[3])  # x2
+        all_x.sort()
+        # 聚类阈值：median cell width 的一半
+        cell_widths = [c[3] - c[2] for c in cells]
+        median_w = float(np.median(cell_widths)) if cell_widths else 30
+        cluster_thresh = median_w * 0.4
+        clusters = []
+        cur = [all_x[0]]
+        for x in all_x[1:]:
+            if x - cur[-1] <= cluster_thresh:
+                cur.append(x)
+            else:
+                clusters.append(int(round(sum(cur) / len(cur))))
+                cur = [x]
+        clusters.append(int(round(sum(cur) / len(cur))))
+        # 去重过于接近的聚类中心
+        deduped = [clusters[0]]
+        for c in clusters[1:]:
+            if c - deduped[-1] > cluster_thresh * 0.5:
+                deduped.append(c)
+        if len(deduped) < 3:
+            return None, None
+        x_boundaries = deduped  # [x1, x2, x3, ..., xN] where x1=0, xN=table_width
+        # 转为 row major 所需的 col_splits 格式
+        col_splits = [0] + [x_boundaries[i] for i in range(1, len(x_boundaries) - 1)] + [99999]
+        max_cols = len(col_splits) - 1
 
-        rows_n = len(h_pos) - 1
-        cols_n = len(v_pos) - 1
-        if rows_n < 1 or cols_n < 1:
+        # 将每个 rec_box 分配到其中心所在的 grid cell（容差 5px），
+        # 保留 PP-OCR 原始读序（不按坐标重排，保证文字顺序正确）
+        cell_text_lists = {r: {c: [] for c in range(max_cols)} for r in range(len(rows))}
+        rec_assigned = False
+        for bi, box in enumerate(rec_boxes):
+            bx = (box[0] + box[2]) / 2.0
+            by = (box[1] + box[3]) / 2.0
+            txt = rec_texts[bi] if bi < len(rec_texts) else ""
+            sc = float(rec_scores[bi]) if bi < len(rec_scores) else 0.0
+            if not txt.strip() or sc < 0.3:
+                continue
+            # 找所属行（含 5px 容差）
+            row_idx = None
+            for ri, row in enumerate(rows):
+                ry1_ = min(c[0] for c in row)
+                ry2_ = max(c[1] for c in row)
+                if ry1_ - 5 <= by <= ry2_ + 5:
+                    row_idx = ri
+                    break
+            if row_idx is None:
+                continue
+            # 找所属列（含 5px 容差）
+            col_idx = None
+            for ci in range(max_cols):
+                cx1, cx2 = col_splits[ci], col_splits[ci + 1]
+                if cx1 - 5 <= bx <= cx2 + 5:
+                    col_idx = ci
+                    break
+            if col_idx is not None:
+                cell_text_lists[row_idx][col_idx].append(txt)
+                rec_assigned = True
+
+        if not rec_assigned:
             return None, None
 
-        # 文本匹配
-        cell_texts = {}
-        for ri in range(rows_n):
-            y1, y2 = h_pos[ri], h_pos[ri + 1]
-            for ci in range(cols_n):
-                x1, x2 = v_pos[ci], v_pos[ci + 1]
-                best_t, best_s = "", 0.0
-                for bi, box in enumerate(rec_boxes):
-                    bx = (box[0] + box[2]) / 2.0
-                    by = (box[1] + box[3]) / 2.0
-                    if x1 <= bx <= x2 and y1 <= by <= y2:
-                        txt = rec_texts[bi] if bi < len(rec_texts) else ""
-                        sc = float(rec_scores[bi]) if bi < len(rec_scores) else 0.0
-                        if sc > best_s:
-                            best_t, best_s = txt, sc
-                cell_texts[(ri, ci)] = best_t
+        # 每个 cell 内的多个 text 保留 PP-OCR 原始读序，用空格连接
+        cell_text_merged = {}
+        for ri in range(len(rows)):
+            for ci in range(max_cols):
+                items = cell_text_lists[ri][ci]
+                cell_text_merged[(ri, ci)] = " ".join(items).strip() if items else ""
 
-        # 检测 colspan/rowspan
+        col_widths = [col_splits[i+1] - col_splits[i] for i in range(max_cols)]
+        median_w = float(np.median(col_widths)) if col_widths else 1
         colspans = {}
-        for ri in range(rows_n):
-            ci = 0
-            while ci < cols_n:
-                span = 1
-                while ci + span < cols_n:
-                    mid_x = (v_pos[ci] + v_pos[ci + span]) / 2
-                    if not any(abs(vp - mid_x) < 5 for vp in v_pos):
-                        span += 1
-                    else:
-                        break
-                if span > 1:
-                    colspans[(ri, ci)] = span
-                    for s in range(1, span):
-                        if cell_texts.get((ri, ci + s)):
-                            cell_texts[(ri, ci)] = (cell_texts[(ri, ci)] or "") + " " + cell_texts[(ri, ci + s)]
-                ci += span
+        for ri, row in enumerate(rows):
+            for ci in range(len(row) - 1):
+                gap = row[ci+1][2] - row[ci][3]
+                if gap > median_w * 1.2:
+                    spanned = int(round(gap / median_w))
+                    colspans[(ri, ci)] = min(spanned + 1, max_cols - ci)
 
-        rowspans = {}
-        for ci in range(cols_n):
-            ri = 0
-            while ri < rows_n:
-                span = 1
-                while ri + span < rows_n:
-                    mid_y = (h_pos[ri] + h_pos[ri + span]) / 2
-                    if not any(abs(vp - mid_y) < 5 for vp in h_pos):
-                        span += 1
-                    else:
-                        break
-                if span > 1:
-                    rowspans[(ri, ci)] = span
-                    for s in range(1, span):
-                        if cell_texts.get((ri + s, ci)):
-                            cell_texts[(ri, ci)] = (cell_texts[(ri, ci)] or "") + " " + cell_texts[(ri + s, ci)]
-                ri += span
-
-        # 生成 HTML
-        html_parts = ["<html><body><table><tbody>"]
-        for ri in range(rows_n):
-            html_parts.append("<tr>")
+        import html as _html
+        parts = ["<html><body><table><tbody>"]
+        for ri in range(len(rows)):
+            parts.append("<tr>")
             ci = 0
-            while ci < cols_n:
+            while ci < max_cols:
                 skip = False
                 for (pr, pc), ps in colspans.items():
                     if pr == ri and pc < ci < pc + ps:
                         skip = True; break
-                if not skip:
-                    for (pr, pc), ps in rowspans.items():
-                        if pc == ci and pr < ri < pr + ps:
-                            skip = True; break
                 if skip:
                     ci += 1; continue
-                attrs = ""
                 cs = colspans.get((ri, ci), 1)
-                rs = rowspans.get((ri, ci), 1)
-                if cs > 1: attrs += f' colspan="{cs}"'
-                if rs > 1: attrs += f' rowspan="{rs}"'
-                import html as _html
-                safe = _html.escape(cell_texts.get((ri, ci), ""))
-                html_parts.append(f"<td{attrs}>{safe}</td>")
+                attrs = f' colspan="{cs}"' if cs > 1 else ""
+                safe = _html.escape(cell_text_merged.get((ri, ci), ""))
+                parts.append(f"<td{attrs}>{safe}</td>")
                 ci += 1
-            html_parts.append("</tr>")
-        html_parts.append("</tbody></table></body></html>")
-        grid_html = "\n".join(html_parts)
+            parts.append("</tr>")
+        parts.append("</tbody></table></body></html>")
+        grid_html = "\n".join(parts)
+
+        text_count = sum(1 for v in cell_text_merged.values() if v.strip())
+        if text_count < 2:
+            return None, None
 
         elements = [{
             "id": "e0",
@@ -677,53 +624,6 @@ class TableRecognitionEngine:
             "content": {"html": grid_html},
         }]
         return grid_html, elements
-
-        # 生成 HTML
-        html_parts = ["<html><body><table><tbody>"]
-        for ri in range(rows_n):
-            html_parts.append("<tr>")
-            ci = 0
-            while ci < cols_n:
-                # 跳过被 colspan/rowspan 吞并的次要 cell
-                skip = False
-                for (pr, pc), ps in colspans.items():
-                    if pr == ri and pc < ci < pc + ps:
-                        skip = True
-                        break
-                if not skip:
-                    for (pr, pc), ps in rowspans.items():
-                        if pc == ci and pr < ri < pr + ps:
-                            skip = True
-                            break
-                if skip:
-                    ci += 1
-                    continue
-
-                attrs = ""
-                cs = colspans.get((ri, ci), 1)
-                rs = rowspans.get((ri, ci), 1)
-                if cs > 1:
-                    attrs += f' colspan="{cs}"'
-                if rs > 1:
-                    attrs += f' rowspan="{rs}"'
-                import html as _html
-                safe = _html.escape(cell_texts.get((ri, ci), ""))
-                html_parts.append(f"<td{attrs}>{safe}</td>")
-                ci += 1
-            html_parts.append("</tr>")
-        html_parts.append("</tbody></table></body></html>")
-        grid_html = "\n".join(html_parts)
-
-        elements = [{
-            "id": "e0",
-            "type": "table",
-            "reading_order": 0,
-            "bbox": table_bbox,
-            "confidence": None,
-            "content": {"html": grid_html},
-        }]
-        return grid_html, elements
-
     def predict_batch(self, image_paths: list, concurrency: int = 4) -> list:
         """批量表格识别 — 线程池并发"""
         concurrency = settings.MAX_CONCURRENT  # 实际值从 .env 的 MAX_CONCURRENT 读取
