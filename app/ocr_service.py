@@ -126,7 +126,7 @@ class OCREngine:
     def _process_image(self, router: ModelRouter, image_path: str, include: list = None,
                        mode: str = None) -> dict:
         """处理单张图片 — 通过路由引擎调度"""
-        mode = mode or "routing"
+        mode = mode or "vlm"
         result = router.process_with_route(image_path, mode=mode)
 
         route = result.get("route", "vlm")
@@ -164,7 +164,7 @@ class OCREngine:
         if total_pages == 0:
             raise ValueError("PDF文件为空")
 
-        pdf_mode = mode or "routing"
+        pdf_mode = mode or "vlm"
 
         all_results = []
         total_light = 0

@@ -1271,7 +1271,7 @@ class ModelRouter:
                 results[i] = self.predict_vlm(upscaled, task_type="table")
         return results
 
-    def process_with_route(self, image_path: str, mode: str = "routing") -> dict:
+    def process_with_route(self, image_path: str, mode: str = "vlm") -> dict:
         """
         完整处理流程：分类 → 路由 → 识别。
 

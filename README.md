@@ -287,7 +287,7 @@ X-API-Key: your-api-key-here
   "image": "<文件路径 | URL | Base64编码>",
   "filename": "文件名.pdf",
   "page_size": 20,
-  "mode": "routing",
+  "mode": "vlm",
   "include": ["markdown", "elements"]
 }
 ```
@@ -297,7 +297,7 @@ X-API-Key: your-api-key-here
 | `image` | string | 是 | 支持三种格式：**本地路径** / **URL** / **Base64** |
 | `filename` | string | 否 | 文件名（用于日志和调试） |
 | `page_size` | int | 否 | PDF 分页大小（默认 20，-1 不分批整份处理） |
-| `mode` | string | 否 | 路由模式：`"routing"`（默认）版面分类后路由到专业引擎；`"vlm"` 全部使用 PaddleOCR-VL；`"table_pp"` 强制走 PPStructure 表格管线 |
+| `mode` | string | 否 | 路由模式：`"vlm"`（默认）全部使用 PaddleOCR-VL 快速全图理解；`"routing"` 版面分类后路由到专业引擎；`"table_pp"` 强制走 PPStructure 表格管线 |
 | `include` | string[] | 否 | 按需返回字段列表，见 [include 参数](#include-参数按需返回字段) |
 
 ### POST /v1/ocr 响应——完整示例
