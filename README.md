@@ -298,6 +298,8 @@ X-API-Key: your-api-key-here
 | `filename` | string | 否 | 文件名（用于日志和调试） |
 | `page_size` | int | 否 | PDF 分页大小（默认 20，-1 不分批整份处理） |
 | `mode` | string | 否 | 路由模式：`"vlm"`（默认）全部使用 PaddleOCR-VL 快速全图理解；`"routing"` 版面分类后路由到专业引擎；`"table_pp"` 强制走 PPStructure 表格管线 |
+| `use_doc_orientation_classify` | bool | 否 | 是否启用文档方向分类（覆盖全局 `USE_DOC_ORIENTATION_CLASSIFY` 配置），默认按服务端配置 |
+| `use_doc_unwarping` | bool | 否 | 是否启用文档矫正（覆盖全局 `USE_DOC_UNWARPING` 配置），默认按服务端配置 |
 | `include` | string[] | 否 | 按需返回字段列表，见 [include 参数](#include-参数按需返回字段) |
 
 ### POST /v1/ocr 响应——完整示例
@@ -359,18 +361,27 @@ X-API-Key: your-api-key-here
 ```
 响应
 ├── 文件级 (data)
+│   ├── index ── 序号
+│   ├── filename ── 文件名
+│   ├── file_type ── 文件类型 (image/pdf)
+│   ├── success ── 处理成功状态
+│   ├── total_pages ── 总页数
 │   ├── markdown ── 所有页合并的可读 Markdown
 │   ├── text     ── 所有页合并的纯文本
 │   ├── pages ── 逐页结果
 │   │   └── 每页:
-│   │       ├── elements      ← ★ 原始层 (bbox + 置信度 + 结构化)
-│   │       ├── layout_blocks ←   版面位置标注
-│   │       ├── markdown      ←   可读层 (页码锚点分隔)
-│   │       ├── text          ←   可读层 (纯文本)
-│   │       ├── route         ←   路由标识
-│   │       └── error_detail  ←   错误详情 (仅 route=error 时)
+│   │       ├── page            ← 页码（从 1 开始）
+│   │       ├── elements        ← ★ 原始层 (bbox + 置信度 + 结构化)
+│   │       ├── layout_blocks   ←   版面位置标注
+│   │       ├── markdown        ←   可读层 (页码锚点分隔)
+│   │       ├── text            ←   可读层 (纯文本)
+│   │       ├── route           ←   路由标识
+│   │       ├── timing_ms       ←   该页处理耗时
+│   │       ├── error_detail    ←   错误详情 (仅 route=error 时)
+│   │       └── hallucination_warnings  ← VLM 幻觉检测警告（仅启用时）
 │   ├── route_summary ── 路由统计
-│   └── total_timing_ms ── 总耗时
+│   ├── total_timing_ms ── 总耗时
+│   └── error ── 文件级错误信息（处理失败时）
 ```
 
 ### 两条消费路径
@@ -667,13 +678,19 @@ HOST=0.0.0.0                        # 监听地址
 API_KEYS=your-api-key-here          # API 鉴权密钥
 DEVICE=gpu                          # gpu | cpu
 DEVICE_ID=0                         # GPU 设备号
+USE_DOC_ORIENTATION_CLASSIFY=True   # 文档方向分类
+USE_DOC_UNWARPING=False             # 文档矫正
 ROUTING_ENABLED=True                # 启用路由加速
 ROUTING_COMPLEX_THRESHOLD=0.3       # 复杂区域占比阈值
 LAYOUT_CONFIDENCE_THRESHOLD=0.3     # Layout 检测置信度
 PDF_PAGE_SIZE=20                    # PDF 分页批处理大小
+PDF_DPI_DEFAULT=200                 # 普通页渲染 DPI
+PDF_DPI_TABLE=300                   # 表格页渲染 DPI
+MAX_CONCURRENT=4                    # 最大并发数
 REQUEST_TIMEOUT=300                 # 请求超时（秒）
 VLM_BACKEND=llamacpp                # VLM 后端
 LLAMACPP_URL=http://localhost:8118  # llama.cpp 地址
+LOG_LEVEL=INFO                      # 日志级别
 ```
 
 完整配置项见 [`.env.example`](.env.example)。
