@@ -345,8 +345,6 @@ X-API-Key: your-api-key-here
 }
 ```
 
-```
-
 ---
 
 ## Response 数据结构详解
